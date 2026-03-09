@@ -2,6 +2,7 @@
 enum SubmenuIndex {
     SubmenuIndexReadHF,
     SubmenuIndexReadUHF,
+    SubmenuIndexIce1803Sam,
     SubmenuIndexSaved,
     SubmenuIndexAPDURunner,
     SubmenuIndexSamInfo,
@@ -10,6 +11,13 @@ enum SubmenuIndex {
 };
 
 static uint8_t fwChecks = 3;
+
+static bool seader_scene_sam_present_should_show_read_uhf(const Seader* seader) {
+    if(!seader || !seader->worker) return false;
+    return seader_uhf_should_show_root_menu(
+        seader->uhf && seader_uhf_is_available(seader->uhf),
+        (SeaderUhfSamSupport)seader->worker->uhf_sam_support);
+}
 
 void seader_scene_sam_present_submenu_callback(void* context, uint32_t index) {
     Seader* seader = context;
@@ -25,11 +33,19 @@ void seader_scene_sam_present_on_update(void* context) {
 
     submenu_add_item(
         submenu, "Read HF", SubmenuIndexReadHF, seader_scene_sam_present_submenu_callback, seader);
-    if(seader->uhf && seader_uhf_is_available(seader->uhf)) {
+    if(seader_scene_sam_present_should_show_read_uhf(seader)) {
         submenu_add_item(
             submenu,
             "Read UHF",
             SubmenuIndexReadUHF,
+            seader_scene_sam_present_submenu_callback,
+            seader);
+    }
+    if(seader->sam_is_ice1803) {
+        submenu_add_item(
+            submenu,
+            "ICE1803 SAM",
+            SubmenuIndexIce1803Sam,
             seader_scene_sam_present_submenu_callback,
             seader);
     }
@@ -76,6 +92,11 @@ void seader_scene_sam_present_on_update(void* context) {
 }
 
 void seader_scene_sam_present_on_enter(void* context) {
+    Seader* seader = context;
+    if(seader->uhf) {
+        seader_uhf_end(seader->uhf);
+        seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
+    }
     seader_scene_sam_present_on_update(context);
 }
 
@@ -84,17 +105,23 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
     bool consumed = false;
 
     if(event.type == SceneManagerEventTypeCustom) {
+        if(event.event == SeaderCustomEventSamStatusUpdated) {
+            seader_scene_sam_present_on_update(context);
+            return true;
+        }
         scene_manager_set_scene_state(seader->scene_manager, SeaderSceneSamPresent, event.event);
 
         if(event.event == SubmenuIndexReadHF) {
             seader->read_scope = SeaderReadScopeHF;
             seader->selected_read_type = SeaderCredentialTypeNone;
+            seader->uhf_read_mode = SeaderUhfReadModeNone;
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
             consumed = true;
         } else if(event.event == SubmenuIndexReadUHF) {
-            seader->read_scope = SeaderReadScopeUHF;
-            seader->selected_read_type = SeaderCredentialTypeUhf;
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
+            consumed = true;
+        } else if(event.event == SubmenuIndexIce1803Sam) {
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneSamInfo);
             consumed = true;
         } else if(event.event == SubmenuIndexReadConfigCard) {
             scene_manager_set_scene_state(

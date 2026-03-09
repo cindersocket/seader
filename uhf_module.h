@@ -63,6 +63,8 @@ typedef struct SeaderUhf SeaderUhf;
 SeaderUhf* seader_uhf_alloc(void);
 void seader_uhf_free(SeaderUhf* uhf);
 
+bool seader_uhf_begin(SeaderUhf* uhf);
+void seader_uhf_end(SeaderUhf* uhf);
 bool seader_uhf_refresh_presence(SeaderUhf* uhf);
 bool seader_uhf_is_available(const SeaderUhf* uhf);
 const SeaderUhfModuleProfile* seader_uhf_get_profile(const SeaderUhf* uhf);

@@ -25,19 +25,31 @@ Seader* seader_alloc() {
     Seader* seader = malloc(sizeof(Seader));
     seader_trace_reset();
 
-    seader->revert_power = !furi_hal_power_is_otg_enabled();
-    if(seader->revert_power) {
-        furi_hal_power_enable_otg();
-    }
     seader->is_debug_enabled = furi_hal_rtc_is_flag_set(FuriHalRtcFlagDebug);
     seader->samCommand = SamCommand_PR_NOTHING;
     seader->sam_state = SeaderSamStateIdle;
     seader->sam_intent = SeaderSamIntentNone;
     seader->sam_card_announced = false;
+    seader->sam_present = false;
     memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
     seader->detected_card_type_count = 0;
     seader->selected_read_type = SeaderCredentialTypeNone;
     seader->read_scope = SeaderReadScopeAll;
+    seader->uhf_read_mode = SeaderUhfReadModeNone;
+    seader->uhf_sam_support = SeaderUhfSamSupportUnknown;
+    seader->snmp_probe_stage = SeaderSnmpProbeStageIdle;
+    seader->sam_is_ice1803 = false;
+    seader->snmp_monza_key_supported = false;
+    seader->snmp_higgs_key_supported = false;
+    seader->snmp_usm_engine_id_len = 0;
+    seader->snmp_usm_username_len = 0;
+    seader->snmp_usm_engine_boots = 0;
+    seader->snmp_usm_engine_time = 0;
+    memset(seader->snmp_usm_engine_id, 0, sizeof(seader->snmp_usm_engine_id));
+    memset(seader->snmp_usm_username, 0, sizeof(seader->snmp_usm_username));
+    memset(seader->uhf_result_data, 0, sizeof(seader->uhf_result_data));
+    seader->uhf_result_len = 0;
+    memset(seader->uhf_result_label, 0, sizeof(seader->uhf_result_label));
 
     seader->worker = seader_worker_alloc();
     seader->view_dispatcher = view_dispatcher_alloc();
@@ -54,6 +66,7 @@ Seader* seader_alloc() {
     seader->uhf = seader_uhf_alloc();
     if(seader->uhf) {
         (void)seader_uhf_refresh_presence(seader->uhf);
+        seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
     }
 
     seader->credential = seader_credential_alloc();
@@ -138,10 +151,6 @@ void seader_free(Seader* seader) {
     if(seader->sam_card_announced && seader->uart) {
         seader_clear_sam_card_if_announced(seader);
         furi_delay_ms(30);
-    }
-
-    if(seader->revert_power) {
-        furi_hal_power_disable_otg();
     }
 
     seader_uart_free(seader->uart);

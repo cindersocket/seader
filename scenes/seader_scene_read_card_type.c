@@ -47,6 +47,8 @@ bool seader_scene_read_card_type_on_event(void* context, SceneManagerEvent event
         if(type == SeaderCredentialType14A || type == SeaderCredentialTypeMifareClassic ||
            type == SeaderCredentialTypePicopass || type == SeaderCredentialTypeUhf) {
             seader->selected_read_type = type;
+            seader->uhf_read_mode = type == SeaderCredentialTypeUhf ? SeaderUhfReadModeSio :
+                                                                     SeaderUhfReadModeNone;
             seader->detected_card_type_count = 0;
             memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
@@ -55,6 +57,7 @@ bool seader_scene_read_card_type_on_event(void* context, SceneManagerEvent event
     } else if(event.type == SceneManagerEventTypeBack) {
         seader->selected_read_type = SeaderCredentialTypeNone;
         seader->read_scope = SeaderReadScopeAll;
+        seader->uhf_read_mode = SeaderUhfReadModeNone;
         seader->detected_card_type_count = 0;
         memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
         scene_manager_search_and_switch_to_previous_scene(

@@ -56,7 +56,9 @@
 #include "seader_worker.h"
 #include "seader_credential.h"
 #include "apdu_log.h"
+#include "uhf_capability.h"
 #include "uhf_module.h"
+#include "uhf_snmp.h"
 
 #define WORKER_ALL_RX_EVENTS                                                      \
     (WorkerEvtStop | WorkerEvtRxDone | WorkerEvtCfgChange | WorkerEvtLineCfgSet | \
@@ -79,6 +81,7 @@ enum SeaderCustomEvent {
 
     SeaderCustomEventPollerDetect,
     SeaderCustomEventPollerSuccess,
+    SeaderCustomEventSamStatusUpdated,
 };
 
 typedef enum {
@@ -108,7 +111,17 @@ typedef enum {
     SeaderSamStateClearPending,
     SeaderSamStateVersionPending,
     SeaderSamStateSerialPending,
+    SeaderSamStateCapabilityPending,
 } SeaderSamState;
+
+typedef enum {
+    SeaderSnmpProbeStageIdle,
+    SeaderSnmpProbeStageDiscovery,
+    SeaderSnmpProbeStageReadEliteIce,
+    SeaderSnmpProbeStageReadMonzaKey,
+    SeaderSnmpProbeStageReadHiggsKey,
+    SeaderSnmpProbeStageDone,
+} SeaderSnmpProbeStage;
 
 typedef enum {
     SeaderSamIntentNone,
@@ -125,7 +138,6 @@ typedef enum {
 } SeaderReadScope;
 
 struct Seader {
-    bool revert_power;
     bool is_debug_enabled;
     SeaderWorker* worker;
     ViewDispatcher* view_dispatcher;
@@ -139,6 +151,7 @@ struct Seader {
     SeaderSamState sam_state;
     SeaderSamIntent sam_intent;
     bool sam_card_announced;
+    bool sam_present;
     uint8_t ATR[SEADER_MAX_ATR_SIZE];
     size_t ATR_len;
 
@@ -169,6 +182,21 @@ struct Seader {
     size_t detected_card_type_count;
     SeaderCredentialType selected_read_type;
     SeaderReadScope read_scope;
+    SeaderUhfReadMode uhf_read_mode;
+    SeaderUhfSamSupport uhf_sam_support;
+    uint8_t uhf_result_data[SEADER_UHF_USER_DATA_MAX_LEN];
+    size_t uhf_result_len;
+    char uhf_result_label[16];
+    SeaderSnmpProbeStage snmp_probe_stage;
+    bool sam_is_ice1803;
+    bool snmp_monza_key_supported;
+    bool snmp_higgs_key_supported;
+    uint8_t snmp_usm_engine_id[SEADER_SNMP_MAX_ID_LEN];
+    size_t snmp_usm_engine_id_len;
+    uint8_t snmp_usm_username[SEADER_SNMP_MAX_ID_LEN];
+    size_t snmp_usm_username_len;
+    uint32_t snmp_usm_engine_boots;
+    uint32_t snmp_usm_engine_time;
 
     PluginManager* plugin_manager;
     PluginWiegand* plugin_wiegand;

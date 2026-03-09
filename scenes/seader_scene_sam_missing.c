@@ -1,6 +1,7 @@
 #include "../seader_i.h"
 enum SubmenuIndex {
     SubmenuIndexDetectSam,
+    SubmenuIndexReadUhf,
     SubmenuIndexSaved,
 };
 
@@ -12,7 +13,13 @@ void seader_scene_sam_missing_submenu_callback(void* context, uint32_t index) {
 void seader_scene_sam_missing_on_enter(void* context) {
     Seader* seader = context;
 
+    if(seader->uhf) {
+        seader_uhf_end(seader->uhf);
+        seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
+    }
+
     Submenu* submenu = seader->submenu;
+    submenu_reset(submenu);
 
     submenu_add_item(
         submenu,
@@ -20,6 +27,14 @@ void seader_scene_sam_missing_on_enter(void* context) {
         SubmenuIndexDetectSam,
         seader_scene_sam_missing_submenu_callback,
         seader);
+    if(seader->uhf && seader_uhf_is_available(seader->uhf)) {
+        submenu_add_item(
+            submenu,
+            "Read UHF",
+            SubmenuIndexReadUhf,
+            seader_scene_sam_missing_submenu_callback,
+            seader);
+    }
     submenu_add_item(
         submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_missing_submenu_callback, seader);
 
@@ -34,14 +49,25 @@ bool seader_scene_sam_missing_on_event(void* context, SceneManagerEvent event) {
     bool consumed = false;
 
     if(event.type == SceneManagerEventTypeCustom) {
+        if(event.event == SeaderCustomEventSamStatusUpdated) {
+            seader_scene_sam_missing_on_enter(context);
+            return true;
+        }
         if(event.event == SubmenuIndexDetectSam) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneStart);
+            consumed = true;
+        } else if(event.event == SubmenuIndexReadUhf) {
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
             consumed = true;
         } else if(event.event == SubmenuIndexSaved) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneFileSelect);
             consumed = true;
         } else if(event.event == SeaderWorkerEventSamPresent) {
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneSamPresent);
+            seader->sam_present = true;
+            seader->worker->sam_present = true;
+            seader->uhf_sam_support = SeaderUhfSamSupportUnknown;
+            seader->worker->uhf_sam_support = SeaderUhfSamSupportUnknown;
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneStart);
             consumed = true;
         }
     } else if(event.type == SceneManagerEventTypeBack) {

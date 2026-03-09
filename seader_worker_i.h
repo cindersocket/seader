@@ -27,6 +27,9 @@ struct SeaderWorker {
     FuriThread* thread;
     Storage* storage;
     uint8_t sam_version[2];
+    bool sam_present;
+    bool uhf_module_present;
+    uint8_t uhf_sam_support;
     FuriMessageQueue* messages;
     SeaderUartBridge* uart;
     SeaderWorkerCallback callback;

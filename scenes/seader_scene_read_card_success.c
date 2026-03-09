@@ -6,6 +6,7 @@
 static void seader_scene_read_card_success_reset_read_selection(Seader* seader) {
     seader->selected_read_type = SeaderCredentialTypeNone;
     seader->read_scope = SeaderReadScopeAll;
+    seader->uhf_read_mode = SeaderUhfReadModeNone;
     seader->detected_card_type_count = 0;
     memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
 }

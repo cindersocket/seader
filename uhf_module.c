@@ -1,6 +1,7 @@
 #include "uhf_module.h"
 
 #include "seader_i.h"
+#include "uhf_frame.h"
 #include "uhf_logic.h"
 #include "uhf_uart.h"
 
@@ -15,6 +16,8 @@
 #define SEADER_UHF_RX_MAX               96U
 #define SEADER_UHF_PROBE_TIMEOUT_MS     220U
 #define SEADER_UHF_PROBE_STEP_MS        5U
+#define SEADER_UHF_POWER_SETTLE_MS      120U
+#define SEADER_UHF_CLOSE_SETTLE_MS      20U
 #define SEADER_UHF_BUS_ADDRESS          0x2EU
 #define SEADER_UHF_WORDS_TID_READ       0x000CU
 #define SEADER_UHF_WORDS_USER_READ      0x001FU
@@ -28,72 +31,21 @@ struct SeaderUhf {
     char hw_version[24];
     char sw_version[24];
     SeaderUhfTagSnapshot snapshot;
+    bool power_enabled;
+    bool power_owned;
 };
 
 static const uint8_t seader_uhf_cmd_hw_version[] = {0xBB, 0x00, 0x03, 0x00, 0x01, 0x00, 0x04, 0x7E};
 static const uint8_t seader_uhf_cmd_sw_version[] = {0xBB, 0x00, 0x03, 0x00, 0x01, 0x01, 0x05, 0x7E};
 static const uint8_t seader_uhf_cmd_single_poll[] = {0xBB, 0x00, 0x22, 0x00, 0x00, 0x22, 0x7E};
+static const uint8_t seader_uhf_cmd_hibernate[] = {0xBB, 0x00, 0x17, 0x00, 0x00, 0x17, 0x7E};
 static const uint8_t seader_uhf_cmd_rf_off[] = {0xBB, 0x00, 0xB0, 0x00, 0x01, 0x00, 0xB1, 0x7E};
 static const uint8_t seader_uhf_cmd_rf_on[] = {0xBB, 0x00, 0xB0, 0x00, 0x01, 0xFF, 0xB0, 0x7E};
 static const uint16_t seader_uhf_qt_public_mask = 0x4000U;
 
-static uint8_t seader_uhf_checksum(const uint8_t* data, size_t len) {
-    uint32_t sum = 0;
-    for(size_t i = 0; i < len; i++) sum += data[i];
-    return (uint8_t)(sum & 0xFFU);
-}
-
-static bool seader_uhf_build_frame(
-    uint8_t command,
-    const uint8_t* payload,
-    size_t payload_len,
-    uint8_t* frame_out,
-    size_t frame_out_cap,
-    size_t* frame_out_len) {
-    if(!frame_out || !frame_out_len || payload_len > 0xFFFFU) return false;
-    if(7U + payload_len > frame_out_cap) return false;
-
-    frame_out[0] = 0xBBU;
-    frame_out[1] = 0x00U;
-    frame_out[2] = command;
-    frame_out[3] = (uint8_t)(payload_len >> 8U);
-    frame_out[4] = (uint8_t)payload_len;
-    if(payload_len > 0U && payload) memcpy(frame_out + 5U, payload, payload_len);
-    frame_out[5U + payload_len] = seader_uhf_checksum(frame_out + 1U, 4U + payload_len);
-    frame_out[6U + payload_len] = 0x7EU;
-    *frame_out_len = 7U + payload_len;
-    return true;
-}
-
-static bool seader_uhf_try_parse_frame(
-    const uint8_t* stream,
-    size_t stream_len,
-    uint8_t expected_type,
-    uint8_t expected_cmd,
-    uint8_t* payload,
-    size_t payload_cap,
-    size_t* payload_len) {
-    if(!stream || stream_len < 7U || !payload || !payload_len) return false;
-
-    for(size_t offset = 0U; offset + 7U <= stream_len; offset++) {
-        if(stream[offset] != 0xBBU) continue;
-        size_t frame_payload_len = ((size_t)stream[offset + 3U] << 8U) | stream[offset + 4U];
-        size_t frame_len = frame_payload_len + 7U;
-        if(offset + frame_len > stream_len) break;
-        if(stream[offset + frame_len - 1U] != 0x7EU) continue;
-        if(seader_uhf_checksum(stream + offset + 1U, frame_len - 3U) !=
-           stream[offset + frame_len - 2U]) {
-            continue;
-        }
-        if(stream[offset + 1U] != expected_type || stream[offset + 2U] != expected_cmd) continue;
-
-        if(frame_payload_len > payload_cap) frame_payload_len = payload_cap;
-        memcpy(payload, stream + offset + 5U, frame_payload_len);
-        *payload_len = frame_payload_len;
-        return true;
-    }
-
-    return false;
+static void seader_uhf_reset_runtime_state(SeaderUhf* uhf) {
+    if(!uhf) return;
+    memset(&uhf->snapshot, 0, sizeof(uhf->snapshot));
 }
 
 static bool seader_uhf_send_expect(
@@ -185,13 +137,63 @@ static bool seader_uhf_open_session(SeaderUhf* uhf) {
     return seader_uhf_uart_open(&uhf->uart, SEADER_UHF_UART_ID, uhf->profile.baudrate);
 }
 
-static void seader_uhf_close_session(SeaderUhf* uhf) {
+static void seader_uhf_close_session(SeaderUhf* uhf, bool hibernate) {
+    uint8_t payload[SEADER_UHF_RX_MAX] = {0};
+    size_t payload_len = 0U;
+
     if(!uhf) return;
     if(uhf->uart.handle) {
-        (void)seader_uhf_uart_tx(&uhf->uart, seader_uhf_cmd_rf_off, sizeof(seader_uhf_cmd_rf_off));
-        furi_delay_ms(5);
+        (void)seader_uhf_send_expect(
+            uhf,
+            seader_uhf_cmd_rf_off,
+            sizeof(seader_uhf_cmd_rf_off),
+            0x01U,
+            0xB0U,
+            payload,
+            sizeof(payload),
+            &payload_len);
+        furi_delay_ms(SEADER_UHF_CLOSE_SETTLE_MS);
+        if(hibernate) {
+            (void)seader_uhf_send_expect(
+                uhf,
+                seader_uhf_cmd_hibernate,
+                sizeof(seader_uhf_cmd_hibernate),
+                0x01U,
+                0x17U,
+                payload,
+                sizeof(payload),
+                &payload_len);
+            furi_delay_ms(SEADER_UHF_CLOSE_SETTLE_MS);
+        }
     }
     seader_uhf_uart_close(&uhf->uart);
+}
+
+static bool seader_uhf_power_on(SeaderUhf* uhf) {
+    if(!uhf) return false;
+    if(uhf->power_enabled) return true;
+
+    const bool already_on = furi_hal_power_is_otg_enabled();
+    if(!already_on) {
+        furi_hal_power_enable_otg();
+        uhf->power_owned = true;
+    } else {
+        uhf->power_owned = false;
+    }
+    uhf->power_enabled = true;
+    furi_delay_ms(SEADER_UHF_POWER_SETTLE_MS);
+    return true;
+}
+
+static void seader_uhf_power_off(SeaderUhf* uhf) {
+    if(!uhf) return;
+
+    seader_uhf_close_session(uhf, true);
+    if(uhf->power_enabled && uhf->power_owned && furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+    }
+    uhf->power_enabled = false;
+    uhf->power_owned = false;
 }
 
 static bool seader_uhf_apply_ops_profile(SeaderUhf* uhf) {
@@ -452,8 +454,22 @@ SeaderUhf* seader_uhf_alloc(void) {
 
 void seader_uhf_free(SeaderUhf* uhf) {
     if(!uhf) return;
-    seader_uhf_close_session(uhf);
+    seader_uhf_end(uhf);
     free(uhf);
+}
+
+bool seader_uhf_begin(SeaderUhf* uhf) {
+    if(!uhf) return false;
+
+    seader_uhf_reset_runtime_state(uhf);
+    if(!seader_uhf_power_on(uhf)) return false;
+    return seader_uhf_refresh_presence(uhf);
+}
+
+void seader_uhf_end(SeaderUhf* uhf) {
+    if(!uhf) return;
+    seader_uhf_power_off(uhf);
+    seader_uhf_reset_runtime_state(uhf);
 }
 
 bool seader_uhf_refresh_presence(SeaderUhf* uhf) {
@@ -461,6 +477,7 @@ bool seader_uhf_refresh_presence(SeaderUhf* uhf) {
     uint8_t sw_payload[SEADER_UHF_RX_MAX] = {0};
     size_t hw_payload_len = 0U;
     size_t sw_payload_len = 0U;
+    bool temporary_power = false;
     if(!uhf) return false;
 
     memset(uhf->hw_version, 0, sizeof(uhf->hw_version));
@@ -469,7 +486,17 @@ bool seader_uhf_refresh_presence(SeaderUhf* uhf) {
     uhf->version_raw_len = 0U;
     uhf->presence = SeaderUhfModulePresenceAbsent;
 
-    if(!seader_uhf_open_session(uhf)) return false;
+    if(!uhf->power_enabled) {
+        if(!seader_uhf_power_on(uhf)) return false;
+        temporary_power = true;
+    }
+
+    if(!seader_uhf_open_session(uhf)) {
+        if(temporary_power) {
+            seader_uhf_power_off(uhf);
+        }
+        return false;
+    }
     bool hw_ok = seader_uhf_send_expect(
         uhf,
         seader_uhf_cmd_hw_version,
@@ -489,7 +516,14 @@ bool seader_uhf_refresh_presence(SeaderUhf* uhf) {
         sw_payload,
         sizeof(sw_payload),
         &sw_payload_len);
-    seader_uhf_close_session(uhf);
+    seader_uhf_close_session(uhf, temporary_power);
+    if(temporary_power) {
+        if(uhf->power_owned && furi_hal_power_is_otg_enabled()) {
+            furi_hal_power_disable_otg();
+        }
+        uhf->power_enabled = false;
+        uhf->power_owned = false;
+    }
 
     if(!hw_ok && !sw_ok) return false;
 
@@ -536,7 +570,7 @@ bool seader_uhf_inventory_tag(SeaderUhf* uhf, SeaderUhfReadResult* result) {
     if(!uhf || !result) return false;
     memset(result, 0, sizeof(*result));
 
-    if(!seader_uhf_open_session(uhf)) return false;
+    if(!seader_uhf_power_on(uhf) || !seader_uhf_open_session(uhf)) return false;
     bool ok = false;
     do {
         if(!seader_uhf_apply_ops_profile(uhf)) break;
@@ -586,7 +620,7 @@ bool seader_uhf_inventory_tag(SeaderUhf* uhf, SeaderUhfReadResult* result) {
             break;
         }
     } while(false);
-    seader_uhf_close_session(uhf);
+    seader_uhf_close_session(uhf, false);
 
     if(ok) {
         memcpy(&uhf->snapshot, &result->tag, sizeof(uhf->snapshot));
@@ -619,7 +653,7 @@ bool seader_uhf_read_private_data(SeaderUhf* uhf, SeaderUhfReadResult* result) {
                           uhf->snapshot.access_password[3];
     }
 
-    if(!seader_uhf_open_session(uhf)) return false;
+    if(!seader_uhf_power_on(uhf) || !seader_uhf_open_session(uhf)) return false;
     bool ok = false;
     do {
         if(!seader_uhf_apply_ops_profile(uhf)) break;
@@ -699,7 +733,7 @@ bool seader_uhf_read_private_data(SeaderUhf* uhf, SeaderUhfReadResult* result) {
     if(relock_needed) {
         ok = ok && seader_uhf_try_relock_public(uhf, access_password, uhf->snapshot.public_tid);
     }
-    seader_uhf_close_session(uhf);
+    seader_uhf_close_session(uhf, false);
 
     if(ok) {
         result->module_ok = true;
@@ -710,7 +744,7 @@ bool seader_uhf_read_private_data(SeaderUhf* uhf, SeaderUhfReadResult* result) {
 }
 
 void seader_uhf_hibernate(SeaderUhf* uhf) {
-    seader_uhf_close_session(uhf);
+    seader_uhf_power_off(uhf);
 }
 
 static bool seader_uhf_send_response_payload(

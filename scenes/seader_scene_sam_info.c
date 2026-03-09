@@ -27,6 +27,11 @@ void seader_scene_sam_info_on_enter(void* context) {
     widget_add_string_element(
         widget, 64, 5, AlignCenter, AlignCenter, FontSecondary, furi_string_get_cstr(fw_str));
 
+    if(seader->sam_is_ice1803) {
+        widget_add_string_element(
+            widget, 64, 20, AlignCenter, AlignCenter, FontPrimary, "ICE1803 SAM");
+    }
+
     // No need to free fw_str as it's reused from seader struct
 
     view_dispatcher_switch_to_view(seader->view_dispatcher, SeaderViewWidget);

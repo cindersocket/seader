@@ -4,8 +4,11 @@ extern MunitSuite test_lrc_suite;
 extern MunitSuite test_ccid_logic_suite;
 extern MunitSuite test_t1_existing_suite;
 extern MunitSuite test_t1_protocol_suite;
+extern MunitSuite test_uhf_capability_suite;
+extern MunitSuite test_uhf_frame_suite;
 extern MunitSuite test_uhf_logic_suite;
 extern MunitSuite test_uhf_routed_suite;
+extern MunitSuite test_uhf_snmp_suite;
 
 int main(int argc, char* argv[]) {
     MunitSuite child_suites[] = {
@@ -13,8 +16,11 @@ int main(int argc, char* argv[]) {
         {"/t1", test_t1_existing_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/t1", test_t1_protocol_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/ccid", test_ccid_logic_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-capability", test_uhf_capability_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-frame", test_uhf_frame_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/uhf", test_uhf_logic_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/uhf-routed", test_uhf_routed_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-snmp", test_uhf_snmp_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {NULL, NULL, NULL, 0, 0},
     };
     MunitSuite main_suite = {

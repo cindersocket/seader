@@ -14,6 +14,37 @@
     (FURI_HAL_NFC_LL_TXRX_FLAGS_CRC_TX_MANUAL | FURI_HAL_NFC_LL_TXRX_FLAGS_AGC_ON | \
      FURI_HAL_NFC_LL_TXRX_FLAGS_PAR_RX_REMV | FURI_HAL_NFC_LL_TXRX_FLAGS_CRC_RX_KEEP)
 
+static void seader_worker_log_apdu_info(const char* prefix, const uint8_t* data, size_t len) {
+    if(!data || len == 0U) {
+        FURI_LOG_I(TAG, "%s: <empty>", prefix);
+        return;
+    }
+
+    char* display = malloc((len * 2U) + 1U);
+    if(!display) {
+        FURI_LOG_I(TAG, "%s: <oom> len=%u", prefix, (unsigned)len);
+        return;
+    }
+
+    for(size_t i = 0; i < len; i++) {
+        snprintf(display + (i * 2U), (len * 2U + 1U) - (i * 2U), "%02x", data[i]);
+    }
+
+    FURI_LOG_I(TAG, "%s: %s", prefix, display);
+    free(display);
+}
+
+static void seader_worker_log_rapdu_info(const uint8_t* data, size_t len) {
+    if(!data || len < 2U) {
+        seader_worker_log_apdu_info("rAPDU", data, len);
+        return;
+    }
+
+    char prefix[32] = {0};
+    snprintf(prefix, sizeof(prefix), "rAPDU[%02X%02X]", data[len - 2U], data[len - 1U]);
+    seader_worker_log_apdu_info(prefix, data, len);
+}
+
 // Forward declaration
 void seader_send_card_detected(SeaderUartBridge* seader_uart, CardDetails_t* cardDetails);
 void seader_worker_reading(Seader* seader);
@@ -116,8 +147,32 @@ static bool seader_worker_start_read_for_uhf(Seader* seader) {
         return false;
     }
 
-    seader->worker->stage = SeaderPollerEventTypeConversation;
     seader->credential->type = SeaderCredentialTypeUhf;
+    memset(seader->uhf_result_data, 0, sizeof(seader->uhf_result_data));
+    seader->uhf_result_len = 0;
+    memset(seader->uhf_result_label, 0, sizeof(seader->uhf_result_label));
+
+    if(seader->uhf_read_mode == SeaderUhfReadModeEpc) {
+        size_t copy_len = result.tag.epc_len;
+        if(copy_len > sizeof(seader->uhf_result_data)) copy_len = sizeof(seader->uhf_result_data);
+        memcpy(seader->uhf_result_data, result.tag.epc, copy_len);
+        seader->uhf_result_len = copy_len;
+        strlcpy(seader->uhf_result_label, "EPC", sizeof(seader->uhf_result_label));
+        seader->worker->stage = SeaderPollerEventTypeComplete;
+        return true;
+    }
+
+    if(seader->uhf_read_mode == SeaderUhfReadModeTid) {
+        size_t copy_len = result.tag.public_tid_len;
+        if(copy_len > sizeof(seader->uhf_result_data)) copy_len = sizeof(seader->uhf_result_data);
+        memcpy(seader->uhf_result_data, result.tag.public_tid, copy_len);
+        seader->uhf_result_len = copy_len;
+        strlcpy(seader->uhf_result_label, "TID", sizeof(seader->uhf_result_label));
+        seader->worker->stage = SeaderPollerEventTypeComplete;
+        return true;
+    }
+
+    seader->worker->stage = SeaderPollerEventTypeConversation;
 
     if(result.tag.epc_len > sizeof(seader->credential->diversifier)) {
         memcpy(
@@ -199,6 +254,9 @@ SeaderWorker* seader_worker_alloc() {
     seader_worker->context = NULL;
     seader_worker->storage = furi_record_open(RECORD_STORAGE);
     memset(seader_worker->sam_version, 0, sizeof(seader_worker->sam_version));
+    seader_worker->sam_present = false;
+    seader_worker->uhf_module_present = false;
+    seader_worker->uhf_sam_support = SeaderUhfSamSupportUnknown;
 
     seader_worker_change_state(seader_worker, SeaderWorkerStateReady);
 
@@ -346,12 +404,7 @@ bool seader_worker_process_sam_message(Seader* seader, uint8_t* apdu, uint32_t l
         return seader_apdu_runner_response(seader, apdu, len);
     }
 
-    char* display = malloc(len * 2 + 1);
-    memset(display, 0, len * 2 + 1);
-    for(uint8_t i = 0; i < len; i++) {
-        snprintf(display + (i * 2), sizeof(display), "%02x", apdu[i]);
-    }
-    FURI_LOG_I(TAG, "APDU: %s", display);
+    seader_worker_log_rapdu_info(apdu, len);
     seader_trace(
         TAG,
         "sam apdu len=%lu stage=%d sam=%d state=%d intent=%d sw=%02x%02x",
@@ -362,7 +415,6 @@ bool seader_worker_process_sam_message(Seader* seader, uint8_t* apdu, uint32_t l
         seader->sam_intent,
         apdu[len - 2],
         apdu[len - 1]);
-    free(display);
 
     uint8_t SW1 = apdu[len - 2];
     uint8_t SW2 = apdu[len - 1];

@@ -16,10 +16,27 @@
 const uint8_t picopass_iclass_key[] = {0xaf, 0xa7, 0x85, 0xa7, 0xda, 0xb3, 0x33, 0x78};
 const uint8_t seader_oid[] =
     {0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x02, 0x04};
+static const uint8_t seader_snmp_oid_monza4qt_access_key[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01,
+    0x02, 0x01, 0x1E, 0x01, 0x01, 0x01};
+static const uint8_t seader_snmp_oid_higgs3_access_key[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01,
+    0x02, 0x01, 0x22, 0x01, 0x01, 0x01};
+static const uint8_t seader_snmp_oid_elite_ice[] = {0x03, 0x01, 0x07, 0x01, 0x38};
 
 #ifdef ASN1_DEBUG
 char asn1_log[SEADER_UART_RX_BUF_SIZE] = {0};
 #endif
+
+static void seader_publish_sam_capabilities(Seader* seader) {
+    if(!seader || !seader->worker) return;
+    seader->worker->sam_present = seader->sam_present;
+    seader->worker->uhf_sam_support = seader->uhf_sam_support;
+    if(seader->view_dispatcher) {
+        view_dispatcher_send_custom_event(
+            seader->view_dispatcher, SeaderCustomEventSamStatusUpdated);
+    }
+}
 
 // Helper function to log hex data efficiently without large static buffer
 static void
@@ -50,6 +67,62 @@ static void
                 tag, "%s[%zu-%zu]: %s", prefix, offset, offset + current_chunk - 1, hex_chunk);
         }
     }
+}
+
+static void seader_log_apdu_info(const char* prefix, const uint8_t* data, size_t len) {
+    if(!data || len == 0U) {
+        FURI_LOG_I(TAG, "%s: <empty>", prefix);
+        return;
+    }
+
+    char* display = malloc((len * 2U) + 1U);
+    if(!display) {
+        FURI_LOG_I(TAG, "%s: <oom> len=%u", prefix, (unsigned)len);
+        return;
+    }
+
+    for(size_t i = 0; i < len; i++) {
+        snprintf(display + (i * 2U), (len * 2U + 1U) - (i * 2U), "%02x", data[i]);
+    }
+
+    FURI_LOG_I(TAG, "%s: %s", prefix, display);
+    free(display);
+}
+
+static const char* seader_sam_command_name(SamCommand_PR command) {
+    switch(command) {
+    case SamCommand_PR_version:
+        return "version";
+    case SamCommand_PR_cardDetected:
+        return "cardDetected";
+    case SamCommand_PR_processSNMPMessage:
+        return "processSNMPMessage";
+    case SamCommand_PR_serialNumber:
+        return "serialNumber";
+    case SamCommand_PR_getItemKCV:
+        return "getItemKCV";
+    case SamCommand_PR_requestPacs2:
+        return "requestPacs2";
+    case SamCommand_PR_processConfigCard:
+        return "processConfigCard";
+    case SamCommand_PR_NOTHING:
+    default:
+        return "unknown";
+    }
+}
+
+static void
+    seader_log_capdu_info(Seader* seader, const uint8_t* data, size_t len, uint8_t ins, uint8_t p1) {
+    const char* name = seader ? seader_sam_command_name(seader->samCommand) : "unknown";
+    if(ins == 0xC0U) {
+        name = "getResponse";
+    } else if(ins == 0xDAU && p1 == 0x02U) {
+        name = "samPayload";
+    }
+
+    char prefix[48] = {0};
+    snprintf(prefix, sizeof(prefix), "cAPDU[%s]", name);
+    seader_log_apdu_info(prefix, data, len);
 }
 
 #ifdef SEADER_ENABLE_TRACE_LOG
@@ -310,7 +383,9 @@ bool seader_send_apdu(
     SeaderUartBridge* seader_uart = seader_worker->uart;
 
     bool extended = seader_uart->T == 1;
-    uint8_t header_len = extended ? 7 : 5;
+    bool explicit_le =
+        extended && CLA == 0xA0U && INS == 0xDAU && P1 == 0x02U && P2 == 0x63U;
+    uint8_t header_len = extended ? (explicit_le ? 9U : 7U) : 5U;
 
     // Must account for MAX_FRAME_HEADERS headroom in scratchpad mode
     if(MAX_FRAME_HEADERS + header_len + payloadLen > SEADER_UART_RX_BUF_SIZE) {
@@ -353,10 +428,15 @@ bool seader_send_apdu(
         apdu[4] = 0x00;
         apdu[5] = 0x00;
         apdu[6] = payloadLen;
+        if(explicit_le) {
+            apdu[7] = 0x00U;
+            apdu[8] = 0x00U;
+        }
     } else {
         apdu[4] = payloadLen;
     }
 
+    seader_log_capdu_info(seader, apdu, length, INS, P1);
     seader_log_hex_data(TAG, "seader_send_apdu", apdu, length);
 
     if(seader_uart->T == 1) {
@@ -535,6 +615,243 @@ void seader_worker_send_serial_number(Seader* seader) {
 
     seader_send_payload(
         seader, &payload, ExternalApplicationA, SAMInterface, ExternalApplicationA);
+}
+
+static void seader_worker_send_process_snmp_message(
+    Seader* seader,
+    const uint8_t* message,
+    size_t message_len) {
+    if(!seader || !message || message_len == 0U) return;
+
+    SamCommand_t samCommand = {0};
+    samCommand.present = SamCommand_PR_processSNMPMessage;
+    samCommand.choice.processSNMPMessage.buf = (uint8_t*)message;
+    samCommand.choice.processSNMPMessage.size = message_len;
+
+    Payload_t payload = {0};
+    payload.present = Payload_PR_samCommand;
+    payload.choice.samCommand = samCommand;
+
+    seader->samCommand = samCommand.present;
+    seader_send_payload(
+        seader, &payload, ExternalApplicationA, SAMInterface, ExternalApplicationA);
+}
+
+static bool seader_snmp_send_discovery_request(Seader* seader) {
+    uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    size_t message_len = 0U;
+
+    if(!seader_uhf_snmp_build_discovery_request(message, sizeof(message), &message_len)) {
+        FURI_LOG_W(TAG, "SNMP probe: failed to build discovery request");
+        return false;
+    }
+
+    seader_worker_send_process_snmp_message(seader, message, message_len);
+    return true;
+}
+
+static bool seader_snmp_send_key_probe_request(
+    Seader* seader,
+    const uint8_t* oid,
+    size_t oid_len) {
+    uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    size_t message_len = 0U;
+
+    if(!seader || !oid || oid_len == 0U || seader->snmp_usm_engine_id_len == 0U ||
+       seader->snmp_usm_username_len == 0U) {
+        return false;
+    }
+
+    if(!seader_uhf_snmp_build_get_data_request(
+           seader->snmp_usm_engine_id,
+           seader->snmp_usm_engine_id_len,
+           seader->snmp_usm_username,
+           seader->snmp_usm_username_len,
+           seader->snmp_usm_engine_boots,
+           seader->snmp_usm_engine_time,
+           oid,
+           oid_len,
+           message,
+           sizeof(message),
+           &message_len)) {
+        FURI_LOG_W(TAG, "SNMP probe: failed to build key request");
+        return false;
+    }
+
+    seader_worker_send_process_snmp_message(seader, message, message_len);
+    return true;
+}
+
+static bool seader_snmp_send_ice_request(Seader* seader) {
+    return seader_snmp_send_key_probe_request(
+        seader, seader_snmp_oid_elite_ice, sizeof(seader_snmp_oid_elite_ice));
+}
+
+static void seader_snmp_probe_finish(Seader* seader) {
+    if(!seader) return;
+
+    seader->uhf_sam_support = seader_uhf_sam_support_from_key_probe(
+        seader->snmp_monza_key_supported, seader->snmp_higgs_key_supported);
+    seader->snmp_probe_stage = SeaderSnmpProbeStageDone;
+    seader_publish_sam_capabilities(seader);
+    seader_sam_set_state(
+        seader, SeaderSamStateIdle, SeaderSamIntentNone, SamCommand_PR_NOTHING);
+}
+
+static bool seader_snmp_probe_advance(Seader* seader) {
+    if(!seader) return false;
+
+    switch(seader->snmp_probe_stage) {
+    case SeaderSnmpProbeStageDiscovery:
+        seader->snmp_probe_stage = SeaderSnmpProbeStageReadEliteIce;
+        return seader_snmp_send_ice_request(seader);
+    case SeaderSnmpProbeStageReadEliteIce:
+        seader->snmp_probe_stage = SeaderSnmpProbeStageReadMonzaKey;
+        return seader_snmp_send_key_probe_request(
+            seader,
+            seader_snmp_oid_monza4qt_access_key,
+            sizeof(seader_snmp_oid_monza4qt_access_key));
+    case SeaderSnmpProbeStageReadMonzaKey:
+        seader->snmp_probe_stage = SeaderSnmpProbeStageReadHiggsKey;
+        return seader_snmp_send_key_probe_request(
+            seader,
+            seader_snmp_oid_higgs3_access_key,
+            sizeof(seader_snmp_oid_higgs3_access_key));
+    case SeaderSnmpProbeStageReadHiggsKey:
+        seader_snmp_probe_finish(seader);
+        return true;
+    case SeaderSnmpProbeStageDone:
+    case SeaderSnmpProbeStageIdle:
+    default:
+        return false;
+    }
+}
+
+static void seader_snmp_probe_mark_current_key(Seader* seader, bool supported) {
+    if(!seader) return;
+
+    if(seader->snmp_probe_stage == SeaderSnmpProbeStageReadMonzaKey) {
+        seader->snmp_monza_key_supported = supported;
+    } else if(seader->snmp_probe_stage == SeaderSnmpProbeStageReadHiggsKey) {
+        seader->snmp_higgs_key_supported = supported;
+    }
+}
+
+static bool seader_snmp_probe_process_response(Seader* seader, const uint8_t* buf, size_t size) {
+    SeaderUhfSnmpResponseView view = {0};
+    const uint8_t* key_value = NULL;
+    size_t key_value_len = 0U;
+
+    if(!seader || !buf || size == 0U) return false;
+    if(!seader_uhf_snmp_parse_response(buf, size, &view)) {
+        FURI_LOG_W(TAG, "SNMP probe: unable to parse response");
+        return false;
+    }
+
+    switch(seader->snmp_probe_stage) {
+    case SeaderSnmpProbeStageDiscovery:
+        if(view.usm_engine_id_len == 0U || view.usm_username_len == 0U) {
+            FURI_LOG_W(TAG, "SNMP probe: discovery missing USM context");
+            return false;
+        }
+
+        seader->snmp_usm_engine_id_len = view.usm_engine_id_len;
+        if(seader->snmp_usm_engine_id_len > sizeof(seader->snmp_usm_engine_id)) {
+            seader->snmp_usm_engine_id_len = sizeof(seader->snmp_usm_engine_id);
+        }
+        memcpy(
+            seader->snmp_usm_engine_id,
+            view.usm_engine_id,
+            seader->snmp_usm_engine_id_len);
+
+        seader->snmp_usm_username_len = view.usm_username_len;
+        if(seader->snmp_usm_username_len > sizeof(seader->snmp_usm_username)) {
+            seader->snmp_usm_username_len = sizeof(seader->snmp_usm_username);
+        }
+        memcpy(seader->snmp_usm_username, view.usm_username, seader->snmp_usm_username_len);
+
+        seader->snmp_usm_engine_boots = view.usm_engine_boots;
+        seader->snmp_usm_engine_time = view.usm_engine_time;
+        return seader_snmp_probe_advance(seader);
+
+    case SeaderSnmpProbeStageReadEliteIce:
+        if(view.error_status == 0U &&
+           seader_uhf_snmp_find_varbind_octet_value(
+               view.varbind_sequence,
+               view.varbind_sequence_len,
+               seader_snmp_oid_elite_ice,
+               sizeof(seader_snmp_oid_elite_ice),
+               &key_value,
+               &key_value_len)) {
+            seader->sam_is_ice1803 = seader_uhf_is_elite_ice1803(key_value, key_value_len);
+        } else {
+            seader->sam_is_ice1803 = false;
+        }
+        return seader_snmp_probe_advance(seader);
+
+    case SeaderSnmpProbeStageReadMonzaKey:
+        if(view.error_status == 0U &&
+           seader_uhf_snmp_find_varbind_octet_value(
+               view.varbind_sequence,
+               view.varbind_sequence_len,
+               seader_snmp_oid_monza4qt_access_key,
+               sizeof(seader_snmp_oid_monza4qt_access_key),
+               &key_value,
+               &key_value_len) &&
+           key_value_len > 0U) {
+            seader_snmp_probe_mark_current_key(seader, true);
+        } else {
+            seader_snmp_probe_mark_current_key(seader, false);
+        }
+        return seader_snmp_probe_advance(seader);
+
+    case SeaderSnmpProbeStageReadHiggsKey:
+        if(view.error_status == 0U &&
+           seader_uhf_snmp_find_varbind_octet_value(
+               view.varbind_sequence,
+               view.varbind_sequence_len,
+               seader_snmp_oid_higgs3_access_key,
+               sizeof(seader_snmp_oid_higgs3_access_key),
+               &key_value,
+               &key_value_len) &&
+           key_value_len > 0U) {
+            seader_snmp_probe_mark_current_key(seader, true);
+        } else {
+            seader_snmp_probe_mark_current_key(seader, false);
+        }
+        return seader_snmp_probe_advance(seader);
+
+    case SeaderSnmpProbeStageDone:
+    case SeaderSnmpProbeStageIdle:
+    default:
+        return false;
+    }
+}
+
+static void seader_worker_probe_uhf_support(Seader* seader) {
+    if(!seader) return;
+
+    seader->snmp_probe_stage = SeaderSnmpProbeStageDiscovery;
+    seader->sam_is_ice1803 = false;
+    seader->snmp_monza_key_supported = false;
+    seader->snmp_higgs_key_supported = false;
+    seader->snmp_usm_engine_id_len = 0U;
+    seader->snmp_usm_username_len = 0U;
+    seader->snmp_usm_engine_boots = 0U;
+    seader->snmp_usm_engine_time = 0U;
+    memset(seader->snmp_usm_engine_id, 0, sizeof(seader->snmp_usm_engine_id));
+    memset(seader->snmp_usm_username, 0, sizeof(seader->snmp_usm_username));
+
+    seader_sam_set_state(
+        seader,
+        SeaderSamStateCapabilityPending,
+        SeaderSamIntentMaintenance,
+        SamCommand_PR_processSNMPMessage);
+
+    if(!seader_snmp_send_discovery_request(seader)) {
+        seader->uhf_sam_support = SeaderUhfSamSupportUnavailable;
+        seader_snmp_probe_finish(seader);
+    }
 }
 
 void seader_worker_send_version(Seader* seader) {
@@ -931,8 +1248,14 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
     case SeaderSamStateSerialPending:
         FURI_LOG_I(TAG, "samResponse serial");
         seader_parse_serial_number(seader, samResponse->buf, samResponse->size);
-        seader_sam_set_state(
-            seader, SeaderSamStateIdle, SeaderSamIntentNone, SamCommand_PR_NOTHING);
+        seader_worker_probe_uhf_support(seader);
+        break;
+    case SeaderSamStateCapabilityPending:
+        FURI_LOG_I(TAG, "samResponse processSNMPMessage");
+        if(!seader_snmp_probe_process_response(seader, samResponse->buf, samResponse->size)) {
+            seader->uhf_sam_support = SeaderUhfSamSupportUnavailable;
+            seader_snmp_probe_finish(seader);
+        }
         break;
     case SeaderSamStateDetectPending:
         FURI_LOG_I(TAG, "samResponse cardDetected");
@@ -1460,7 +1783,32 @@ bool seader_worker_state_machine(
     case Payload_PR_errorResponse:
         FURI_LOG_W(TAG, "Payload_PR_errorResponse");
         processed = true;
-        view_dispatcher_send_custom_event(seader->view_dispatcher, SeaderCustomEventWorkerExit);
+        if(seader->sam_state == SeaderSamStateCapabilityPending) {
+            ErrorResponse_t* err = &payload->choice.errorResponse;
+            SeaderUhfSnmpProbeResult probe_result = seader_uhf_snmp_classify_probe_error(
+                err->errorCode, err->data.buf, err->data.size);
+
+            if(seader->snmp_probe_stage == SeaderSnmpProbeStageReadEliteIce) {
+                seader->sam_is_ice1803 = false;
+                if(!seader_snmp_probe_advance(seader)) {
+                    seader->uhf_sam_support = SeaderUhfSamSupportUnavailable;
+                    seader_snmp_probe_finish(seader);
+                }
+            } else if(seader->snmp_probe_stage == SeaderSnmpProbeStageReadMonzaKey ||
+               seader->snmp_probe_stage == SeaderSnmpProbeStageReadHiggsKey) {
+                seader_snmp_probe_mark_current_key(
+                    seader, probe_result == SeaderUhfSnmpProbeProtected);
+                if(!seader_snmp_probe_advance(seader)) {
+                    seader->uhf_sam_support = SeaderUhfSamSupportUnavailable;
+                    seader_snmp_probe_finish(seader);
+                }
+            } else {
+                seader->uhf_sam_support = SeaderUhfSamSupportUnavailable;
+                seader_snmp_probe_finish(seader);
+            }
+        } else {
+            view_dispatcher_send_custom_event(seader->view_dispatcher, SeaderCustomEventWorkerExit);
+        }
         break;
     default:
         FURI_LOG_W(TAG, "unhandled payload");
