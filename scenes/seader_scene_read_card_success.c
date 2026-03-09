@@ -3,6 +3,13 @@
 
 #define TAG "SeaderSceneReadCardSuccess"
 
+static void seader_scene_read_card_success_reset_read_selection(Seader* seader) {
+    seader->selected_read_type = SeaderCredentialTypeNone;
+    seader->read_scope = SeaderReadScopeAll;
+    seader->detected_card_type_count = 0;
+    memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
+}
+
 void seader_scene_read_card_success_widget_callback(
     GuiButtonType result,
     InputType type,
@@ -20,9 +27,6 @@ void seader_scene_read_card_success_on_enter(void* context) {
     SeaderCredential* credential = seader->credential;
     PluginWiegand* plugin = seader->plugin_wiegand;
     Widget* widget = seader->widget;
-    seader->selected_read_type = SeaderCredentialTypeNone;
-    seader->detected_card_type_count = 0;
-    memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
 
     // Use reusable strings instead of allocating new ones
     FuriString* type_str = seader->temp_string1;
@@ -136,8 +140,11 @@ bool seader_scene_read_card_success_on_event(void* context, SceneManagerEvent ev
 
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == GuiButtonTypeLeft) {
+            seader_clear_sam_card_if_announced(seader);
             consumed = scene_manager_previous_scene(seader->scene_manager);
         } else if(event.event == GuiButtonTypeRight) {
+            seader_clear_sam_card_if_announced(seader);
+            seader_scene_read_card_success_reset_read_selection(seader);
             if(seader->credential->bit_length > 0) {
                 scene_manager_next_scene(seader->scene_manager, SeaderSceneCardMenu);
             } else {
@@ -146,10 +153,14 @@ bool seader_scene_read_card_success_on_event(void* context, SceneManagerEvent ev
             }
             consumed = true;
         } else if(event.event == GuiButtonTypeCenter) {
+            seader_clear_sam_card_if_announced(seader);
+            seader_scene_read_card_success_reset_read_selection(seader);
             scene_manager_next_scene(seader->scene_manager, SeaderSceneFormats);
             consumed = true;
         }
     } else if(event.type == SceneManagerEventTypeBack) {
+        seader_clear_sam_card_if_announced(seader);
+        seader_scene_read_card_success_reset_read_selection(seader);
         scene_manager_search_and_switch_to_previous_scene(
             seader->scene_manager, SeaderSceneSamPresent);
         consumed = true;

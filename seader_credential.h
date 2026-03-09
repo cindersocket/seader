@@ -19,6 +19,7 @@ typedef enum {
     SeaderCredentialTypeNone,
     SeaderCredentialTypePicopass,
     SeaderCredentialType14A,
+    SeaderCredentialTypeUhf,
     // Might need to make 14a into "javacard" and add Desfire
     SeaderCredentialTypeMifareClassic,
     SeaderCredentialTypeVirtual,
@@ -32,6 +33,7 @@ typedef enum {
     SeaderPacsMediaTypePicopass = 3,
     SeaderPacsMediaTypeMifarePlus = 6,
     SeaderPacsMediaTypeSeos = 7,
+    SeaderPacsMediaTypeUhf = 10,
 } SeaderPacsMediaType;
 
 typedef enum {

@@ -18,12 +18,16 @@ test-host:
 		lib/host_tests/test_ccid_logic.c \
 		lib/host_tests/test_t1_existing.c \
 		lib/host_tests/test_t1_protocol.c \
+		lib/host_tests/test_uhf_logic.c \
+		lib/host_tests/test_uhf_routed.c \
 		lib/host_tests/t1_test_stubs.c \
 		lib/host_tests/bit_buffer_mock.c \
 		lrc.c \
 		ccid_logic.c \
 		t_1_logic.c \
 		t_1.c \
+		uhf_logic.c \
+		uhf_routed.c \
 		-o build/host_tests/seader_tests
 	./build/host_tests/seader_tests
 

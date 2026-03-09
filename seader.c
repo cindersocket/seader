@@ -33,9 +33,11 @@ Seader* seader_alloc() {
     seader->samCommand = SamCommand_PR_NOTHING;
     seader->sam_state = SeaderSamStateIdle;
     seader->sam_intent = SeaderSamIntentNone;
+    seader->sam_card_announced = false;
     memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
     seader->detected_card_type_count = 0;
     seader->selected_read_type = SeaderCredentialTypeNone;
+    seader->read_scope = SeaderReadScopeAll;
 
     seader->worker = seader_worker_alloc();
     seader->view_dispatcher = view_dispatcher_alloc();
@@ -49,6 +51,10 @@ Seader* seader_alloc() {
         seader->view_dispatcher, seader_tick_event_callback, 100);
 
     seader->uart = seader_uart_alloc(seader);
+    seader->uhf = seader_uhf_alloc();
+    if(seader->uhf) {
+        (void)seader_uhf_refresh_presence(seader->uhf);
+    }
 
     seader->credential = seader_credential_alloc();
 
@@ -129,12 +135,20 @@ Seader* seader_alloc() {
 void seader_free(Seader* seader) {
     furi_assert(seader);
 
+    if(seader->sam_card_announced && seader->uart) {
+        seader_clear_sam_card_if_announced(seader);
+        furi_delay_ms(30);
+    }
+
     if(seader->revert_power) {
         furi_hal_power_disable_otg();
     }
 
     seader_uart_free(seader->uart);
     seader->uart = NULL;
+
+    seader_uhf_free(seader->uhf);
+    seader->uhf = NULL;
 
     seader_credential_free(seader->credential);
     seader->credential = NULL;

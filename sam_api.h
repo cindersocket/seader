@@ -17,6 +17,14 @@
 #define NFCInterface         0x14
 #define SAMInterface         0x0a
 
+void seader_send_payload(
+    Seader* seader,
+    Payload_t* payload,
+    uint8_t from,
+    uint8_t to,
+    uint8_t replyTo);
+bool seader_send_uhf_card_detected(Seader* seader, const uint8_t* epc, size_t epc_len);
+
 NfcCommand seader_worker_card_detect(
     Seader* seader,
     uint8_t sak,
@@ -27,6 +35,7 @@ NfcCommand seader_worker_card_detect(
     uint8_t ats_len);
 
 void seader_send_no_card_detected(Seader* seader);
+void seader_clear_sam_card_if_announced(Seader* seader);
 bool seader_sam_can_accept_card(const Seader* seader);
 bool seader_sam_has_active_card(const Seader* seader);
 

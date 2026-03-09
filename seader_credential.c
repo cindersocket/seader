@@ -88,8 +88,10 @@ const char* seader_credential_get_type_label(const SeaderCredential* cred) {
             return "PicoPass";
         case SeaderPacsMediaTypeMifarePlus:
             return "MIFARE Plus";
-        case SeaderPacsMediaTypeSeos:
-            return "Seos";
+    case SeaderPacsMediaTypeSeos:
+        return "Seos";
+    case SeaderPacsMediaTypeUhf:
+        return "UHF";
         }
     }
 
@@ -100,6 +102,8 @@ const char* seader_credential_get_type_label(const SeaderCredential* cred) {
         return "Picopass";
     case SeaderCredentialType14A:
         return "14443A";
+    case SeaderCredentialTypeUhf:
+        return "UHF";
     case SeaderCredentialTypeMifareClassic:
         return "Mifare Classic";
     case SeaderCredentialTypeVirtual:

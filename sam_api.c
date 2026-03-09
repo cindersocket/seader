@@ -1,5 +1,6 @@
 #include "sam_api.h"
 #include "trace_log.h"
+#include "uhf_routed.h"
 #include <toolbox/path.h>
 #include <toolbox/version.h>
 #include <bit_lib/bit_lib.h>
@@ -567,6 +568,40 @@ void seader_send_card_detected(Seader* seader, CardDetails_t* cardDetails) {
 
     seader_send_payload(
         seader, &payload, ExternalApplicationA, SAMInterface, ExternalApplicationA);
+
+    seader->sam_card_announced =
+        cardDetails && cardDetails->protocol.size >= 2 &&
+        cardDetails->protocol.buf[1] != FrameProtocol_none;
+}
+
+bool seader_send_uhf_card_detected(Seader* seader, const uint8_t* epc, size_t epc_len) {
+    if(!seader || !epc || epc_len == 0U) return false;
+
+    CardDetails_t card_details = {0};
+    const uint8_t protocol_bytes[] = {0x00U, 0x14U};
+    bool ok = false;
+
+    do {
+        if(OCTET_STRING_fromBuf(
+               &card_details.protocol, (const char*)protocol_bytes, sizeof(protocol_bytes)) != 0)
+            break;
+        if(OCTET_STRING_fromBuf(&card_details.csn, (const char*)epc, epc_len) != 0) break;
+
+        seader_sam_set_state(
+            seader,
+            SeaderSamStateDetectPending,
+            SeaderSamIntentReadPacs2,
+            SamCommand_PR_cardDetected);
+        seader_send_card_detected(seader, &card_details);
+        seader_trace(
+            TAG,
+            "send uhf cardDetected csn_len=%u",
+            (unsigned)epc_len);
+        ok = true;
+    } while(false);
+
+    ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_CardDetails, &card_details);
+    return ok;
 }
 
 void seader_send_no_card_detected(Seader* seader) {
@@ -583,8 +618,16 @@ void seader_send_no_card_detected(Seader* seader) {
         seader, SeaderSamStateClearPending, SeaderSamIntentNone, SamCommand_PR_cardDetected);
     seader_trace(TAG, "send no-card cardDetected");
     seader_send_card_detected(seader, &cardDetails);
+    seader->sam_card_announced = false;
 
     ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_CardDetails, &cardDetails);
+}
+
+void seader_clear_sam_card_if_announced(Seader* seader) {
+    if(!seader) return;
+    if(seader->sam_card_announced && seader->sam_state != SeaderSamStateClearPending) {
+        seader_send_no_card_detected(seader);
+    }
 }
 
 static bool seader_store_pacs_bits(
@@ -905,6 +948,7 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
     case SeaderSamStateClearPending:
         FURI_LOG_I(TAG, "samResponse clear-detected-card ack");
         seader_trace(TAG, "cardDetected ack clear stage=%d", seader_worker->stage);
+        seader->sam_card_announced = false;
         seader_sam_set_state(
             seader, SeaderSamStateIdle, SeaderSamIntentNone, SamCommand_PR_NOTHING);
         break;
@@ -1407,6 +1451,12 @@ bool seader_worker_state_machine(
                 seader->sam_intent);
         }
         break;
+    case Payload_PR_i2cCommand:
+        FURI_LOG_D(TAG, "Payload_PR_i2cCommand");
+        if(!online && seader->uhf && seader->credential->type == SeaderCredentialTypeUhf) {
+            processed = seader_uhf_handle_i2c_command(seader, seader->uhf, &payload->choice.i2cCommand);
+        }
+        break;
     case Payload_PR_errorResponse:
         FURI_LOG_W(TAG, "Payload_PR_errorResponse");
         processed = true;
@@ -1429,6 +1479,63 @@ bool seader_process_success_response_i(
     Payload_t payload = {0};
     Payload_t* payload_p = &payload;
     bool processed = false;
+
+    if(!online && seader->uhf && seader->credential->type == SeaderCredentialTypeUhf) {
+        SeaderUhfRoutedFrame routed = {0};
+        if(seader_uhf_routed_try_parse_apdu(apdu, len, &routed)) {
+            I2CCommand_t i2c_command = {0};
+            bool routed_ok = false;
+
+            do {
+                if(OCTET_STRING_fromBuf(
+                       &i2c_command.header,
+                       (const char*)routed.i2c_header,
+                       sizeof(routed.i2c_header)) != 0) {
+                    break;
+                }
+                i2c_command.busAddress = (long)routed.bus_address;
+                switch(routed.command) {
+                case SeaderUhfRoutedCommandGetVersion:
+                    i2c_command.uhfModuleCommand.present =
+                        UHFModuleCommand_PR_uhfModuleCommandGetVersion;
+                    break;
+                case SeaderUhfRoutedCommandGetProperties:
+                    i2c_command.uhfModuleCommand.present =
+                        UHFModuleCommand_PR_uhfModuleCommandGetProperties;
+                    break;
+                case SeaderUhfRoutedCommandSetAccessPassword:
+                    i2c_command.uhfModuleCommand.present =
+                        UHFModuleCommand_PR_uhfModuleCommandSetAccessPassword;
+                    if(OCTET_STRING_fromBuf(
+                           &i2c_command.uhfModuleCommand.choice.uhfModuleCommandSetAccessPassword,
+                           (const char*)routed.command_value,
+                           routed.command_value_len) != 0) {
+                        break;
+                    }
+                    break;
+                case SeaderUhfRoutedCommandGetPrivateData:
+                    i2c_command.uhfModuleCommand.present =
+                        UHFModuleCommand_PR_uhfModuleCommandGetPrivateData;
+                    break;
+                default:
+                    break;
+                }
+
+                if(i2c_command.uhfModuleCommand.present != UHFModuleCommand_PR_NOTHING) {
+                    processed = seader_uhf_handle_i2c_command(seader, seader->uhf, &i2c_command);
+                    routed_ok = true;
+                }
+            } while(false);
+
+            ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_I2CCommand, &i2c_command);
+            if(routed_ok) {
+                if(!processed) {
+                    seader_abort_active_read(seader);
+                }
+                return processed;
+            }
+        }
+    }
 
     asn_dec_rval_t rval =
         asn_decode(0, ATS_DER, &asn_DEF_Payload, (void**)&payload_p, apdu + 6, len - 6);

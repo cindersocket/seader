@@ -81,26 +81,60 @@ static size_t seader_worker_detect_supported_types(
     size_t detected_capacity) {
     UNUSED(detected_capacity);
     size_t detected_type_count = 0;
-    NfcPoller* poller_detect = nfc_poller_alloc(seader->nfc, NfcProtocolIso14443_4a);
-    if(nfc_poller_detect(poller_detect)) {
-        seader_worker_add_detected_type(
-            detected_types, &detected_type_count, SeaderCredentialType14A);
-    }
-    nfc_poller_free(poller_detect);
+    if(seader->read_scope != SeaderReadScopeUHF) {
+        NfcPoller* poller_detect = nfc_poller_alloc(seader->nfc, NfcProtocolIso14443_4a);
+        if(nfc_poller_detect(poller_detect)) {
+            seader_worker_add_detected_type(
+                detected_types, &detected_type_count, SeaderCredentialType14A);
+        }
+        nfc_poller_free(poller_detect);
 
-    poller_detect = nfc_poller_alloc(seader->nfc, NfcProtocolMfClassic);
-    if(nfc_poller_detect(poller_detect)) {
-        seader_worker_add_detected_type(
-            detected_types, &detected_type_count, SeaderCredentialTypeMifareClassic);
-    }
-    nfc_poller_free(poller_detect);
+        poller_detect = nfc_poller_alloc(seader->nfc, NfcProtocolMfClassic);
+        if(nfc_poller_detect(poller_detect)) {
+            seader_worker_add_detected_type(
+                detected_types, &detected_type_count, SeaderCredentialTypeMifareClassic);
+        }
+        nfc_poller_free(poller_detect);
 
-    if(seader_worker_detect_picopass(seader->nfc)) {
+        if(seader_worker_detect_picopass(seader->nfc)) {
+            seader_worker_add_detected_type(
+                detected_types, &detected_type_count, SeaderCredentialTypePicopass);
+        }
+    }
+
+    if(seader->read_scope != SeaderReadScopeHF && seader->uhf && seader_uhf_is_available(seader->uhf)) {
         seader_worker_add_detected_type(
-            detected_types, &detected_type_count, SeaderCredentialTypePicopass);
+            detected_types, &detected_type_count, SeaderCredentialTypeUhf);
     }
 
     return detected_type_count;
+}
+
+static bool seader_worker_start_read_for_uhf(Seader* seader) {
+    SeaderUhfReadResult result = {0};
+    if(!seader->uhf || !seader_uhf_inventory_tag(seader->uhf, &result)) {
+        return false;
+    }
+
+    seader->worker->stage = SeaderPollerEventTypeConversation;
+    seader->credential->type = SeaderCredentialTypeUhf;
+
+    if(result.tag.epc_len > sizeof(seader->credential->diversifier)) {
+        memcpy(
+            seader->credential->diversifier,
+            result.tag.epc + result.tag.epc_len - sizeof(seader->credential->diversifier),
+            sizeof(seader->credential->diversifier));
+        seader->credential->diversifier_len = sizeof(seader->credential->diversifier);
+    } else {
+        memcpy(seader->credential->diversifier, result.tag.epc, result.tag.epc_len);
+        seader->credential->diversifier_len = result.tag.epc_len;
+    }
+
+    if(result.tag.sam_csn_len > 0U) {
+        return seader_send_uhf_card_detected(seader, result.tag.sam_csn, result.tag.sam_csn_len);
+    }
+
+    return seader_send_uhf_card_detected(seader, result.tag.epc, result.tag.epc_len);
 }
 
 static bool seader_worker_start_read_for_type(Seader* seader, SeaderCredentialType type) {
@@ -143,6 +177,9 @@ static bool seader_worker_start_read_for_type(Seader* seader, SeaderCredentialTy
         picopass_poller_start(
             seader->picopass_poller, seader_worker_poller_callback_picopass, seader);
         return true;
+    } else if(type == SeaderCredentialTypeUhf) {
+        FURI_LOG_I(TAG, "Detected UHF tag");
+        return seader_worker_start_read_for_uhf(seader);
     }
 
     return false;

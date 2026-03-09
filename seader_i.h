@@ -56,6 +56,7 @@
 #include "seader_worker.h"
 #include "seader_credential.h"
 #include "apdu_log.h"
+#include "uhf_module.h"
 
 #define WORKER_ALL_RX_EVENTS                                                      \
     (WorkerEvtStop | WorkerEvtRxDone | WorkerEvtCfgChange | WorkerEvtLineCfgSet | \
@@ -114,7 +115,14 @@ typedef enum {
     SeaderSamIntentReadPacs2,
     SeaderSamIntentConfig,
     SeaderSamIntentMaintenance,
+    SeaderSamIntentUhfRead,
 } SeaderSamIntent;
+
+typedef enum {
+    SeaderReadScopeAll,
+    SeaderReadScopeHF,
+    SeaderReadScopeUHF,
+} SeaderReadScope;
 
 struct Seader {
     bool revert_power;
@@ -125,10 +133,12 @@ struct Seader {
     NotificationApp* notifications;
     SceneManager* scene_manager;
     SeaderUartBridge* uart;
+    SeaderUhf* uhf;
     SeaderCredential* credential;
     SamCommand_PR samCommand;
     SeaderSamState sam_state;
     SeaderSamIntent sam_intent;
+    bool sam_card_announced;
     uint8_t ATR[SEADER_MAX_ATR_SIZE];
     size_t ATR_len;
 
@@ -158,6 +168,7 @@ struct Seader {
     SeaderCredentialType detected_card_types[SEADER_MAX_DETECTED_CARD_TYPES];
     size_t detected_card_type_count;
     SeaderCredentialType selected_read_type;
+    SeaderReadScope read_scope;
 
     PluginManager* plugin_manager;
     PluginWiegand* plugin_wiegand;

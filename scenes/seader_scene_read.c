@@ -2,14 +2,28 @@
 #include "seader_scene_read_common.h"
 #include <dolphin/dolphin.h>
 
+static bool seader_scene_read_is_uhf(const Seader* seader) {
+    return seader->read_scope == SeaderReadScopeUHF ||
+           seader->selected_read_type == SeaderCredentialTypeUhf;
+}
+
 void seader_scene_read_on_enter(void* context) {
     Seader* seader = context;
     dolphin_deed(DolphinDeedNfcRead);
 
     // Setup view
     Popup* popup = seader->popup;
-    popup_set_header(popup, "Detecting\nHF card...", 68, 30, AlignLeft, AlignTop);
-    popup_set_icon(popup, 0, 3, &I_RFIDDolphinReceive_97x61);
+    const bool is_uhf = seader_scene_read_is_uhf(seader);
+    if(is_uhf) {
+        popup_set_header(popup, NULL, 0, 0, AlignLeft, AlignTop);
+    } else {
+        popup_set_header(popup, "Detecting\nHF card...", 68, 30, AlignLeft, AlignTop);
+    }
+    popup_set_icon(
+        popup,
+        0,
+        3,
+        is_uhf ? &I_RFIDDolphinReceiveUHF_97x61 : &I_RFIDDolphinReceive_97x61);
 
     // Start worker
     view_dispatcher_switch_to_view(seader->view_dispatcher, SeaderViewPopup);
@@ -51,6 +65,7 @@ bool seader_scene_read_on_event(void* context, SceneManagerEvent event) {
         }
     } else if(event.type == SceneManagerEventTypeBack) {
         seader->selected_read_type = SeaderCredentialTypeNone;
+        seader->read_scope = SeaderReadScopeAll;
         seader->detected_card_type_count = 0;
         memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
         scene_manager_search_and_switch_to_previous_scene(

@@ -35,9 +35,7 @@ void seader_scene_read_cleanup(Seader* seader) {
         seader->sam_intent);
     seader_worker_cancel_poller_session(seader->worker);
 
-    if(seader_sam_has_active_card(seader)) {
-        seader_send_no_card_detected(seader);
-    }
+    seader_clear_sam_card_if_announced(seader);
 
     popup_reset(seader->popup);
     seader_worker_reset_poller_session(seader->worker);

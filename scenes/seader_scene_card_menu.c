@@ -88,6 +88,7 @@ bool seader_scene_card_menu_on_event(void* context, SceneManagerEvent event) {
             consumed = true;
         }
     } else if(event.type == SceneManagerEventTypeBack) {
+        seader_clear_sam_card_if_announced(seader);
         consumed = scene_manager_search_and_switch_to_previous_scene(
             seader->scene_manager, SeaderSceneSamPresent);
     }

@@ -1,6 +1,7 @@
 #include "../seader_i.h"
 enum SubmenuIndex {
-    SubmenuIndexRead,
+    SubmenuIndexReadHF,
+    SubmenuIndexReadUHF,
     SubmenuIndexSaved,
     SubmenuIndexAPDURunner,
     SubmenuIndexSamInfo,
@@ -23,7 +24,15 @@ void seader_scene_sam_present_on_update(void* context) {
     submenu_reset(submenu);
 
     submenu_add_item(
-        submenu, "Read HF", SubmenuIndexRead, seader_scene_sam_present_submenu_callback, seader);
+        submenu, "Read HF", SubmenuIndexReadHF, seader_scene_sam_present_submenu_callback, seader);
+    if(seader->uhf && seader_uhf_is_available(seader->uhf)) {
+        submenu_add_item(
+            submenu,
+            "Read UHF",
+            SubmenuIndexReadUHF,
+            seader_scene_sam_present_submenu_callback,
+            seader);
+    }
     submenu_add_item(
         submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_present_submenu_callback, seader);
 
@@ -77,7 +86,14 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
     if(event.type == SceneManagerEventTypeCustom) {
         scene_manager_set_scene_state(seader->scene_manager, SeaderSceneSamPresent, event.event);
 
-        if(event.event == SubmenuIndexRead) {
+        if(event.event == SubmenuIndexReadHF) {
+            seader->read_scope = SeaderReadScopeHF;
+            seader->selected_read_type = SeaderCredentialTypeNone;
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+            consumed = true;
+        } else if(event.event == SubmenuIndexReadUHF) {
+            seader->read_scope = SeaderReadScopeUHF;
+            seader->selected_read_type = SeaderCredentialTypeUhf;
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
             consumed = true;
         } else if(event.event == SubmenuIndexReadConfigCard) {
@@ -101,6 +117,7 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
             consumed = true;
         }
     } else if(event.type == SceneManagerEventTypeBack) {
+        seader_clear_sam_card_if_announced(seader);
         scene_manager_stop(seader->scene_manager);
         view_dispatcher_stop(seader->view_dispatcher);
         consumed = true;
