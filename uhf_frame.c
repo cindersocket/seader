@@ -26,8 +26,7 @@ bool seader_uhf_build_frame(
     frame_out[3] = (uint8_t)(payload_len >> 8U);
     frame_out[4] = (uint8_t)payload_len;
     if(payload_len > 0U && payload) memcpy(frame_out + 5U, payload, payload_len);
-    frame_out[5U + payload_len] =
-        seader_uhf_frame_checksum(frame_out + 1U, 4U + payload_len);
+    frame_out[5U + payload_len] = seader_uhf_frame_checksum(frame_out + 1U, 4U + payload_len);
     frame_out[6U + payload_len] = 0x7EU;
     *frame_out_len = 7U + payload_len;
     return true;

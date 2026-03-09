@@ -35,8 +35,8 @@ bool seader_uhf_build_sam_csn_from_public_tid(
 
 SeaderUhfTidView seader_uhf_classify_tid_view(const uint8_t* tid, size_t tid_len);
 
-SeaderUhfPrivateReadPlan seader_uhf_plan_private_read(
-    bool have_access_password, bool qt_known, uint16_t qt_control);
+SeaderUhfPrivateReadPlan
+    seader_uhf_plan_private_read(bool have_access_password, bool qt_known, uint16_t qt_control);
 
 bool seader_uhf_normalize_private_data_for_sam(
     const uint8_t* tid,

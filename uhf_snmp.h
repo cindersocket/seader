@@ -22,6 +22,8 @@ typedef struct {
 } SeaderUhfSnmpResponseView;
 
 bool seader_uhf_snmp_build_discovery_request(
+    uint8_t* scratch,
+    size_t scratch_capacity,
     uint8_t* message,
     size_t message_capacity,
     size_t* message_len);
@@ -35,6 +37,8 @@ bool seader_uhf_snmp_build_get_data_request(
     uint32_t engine_time,
     const uint8_t* target_oid,
     size_t target_oid_len,
+    uint8_t* scratch,
+    size_t scratch_capacity,
     uint8_t* message,
     size_t message_capacity,
     size_t* message_len);

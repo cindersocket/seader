@@ -48,7 +48,7 @@ bool seader_scene_read_card_type_on_event(void* context, SceneManagerEvent event
            type == SeaderCredentialTypePicopass || type == SeaderCredentialTypeUhf) {
             seader->selected_read_type = type;
             seader->uhf_read_mode = type == SeaderCredentialTypeUhf ? SeaderUhfReadModeSio :
-                                                                     SeaderUhfReadModeNone;
+                                                                      SeaderUhfReadModeNone;
             seader->detected_card_type_count = 0;
             memset(seader->detected_card_types, 0, sizeof(seader->detected_card_types));
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);

@@ -8,8 +8,8 @@ bool seader_uhf_build_sam_csn_from_public_tid(
     uint8_t* csn_out,
     size_t csn_out_cap,
     size_t* csn_out_len) {
-    static const uint8_t prefix[10] =
-        {0xE2U, 0x80U, 0x11U, 0x05U, 0x00U, 0x00U, 0x72U, 0x38U, 0x00U, 0x00U};
+    static const uint8_t prefix[10] = {
+        0xE2U, 0x80U, 0x11U, 0x05U, 0x00U, 0x00U, 0x72U, 0x38U, 0x00U, 0x00U};
 
     if(!public_tid || !csn_out || !csn_out_len || csn_out_cap < SEADER_UHF_NORMALIZED_CSN_LEN) {
         return false;
@@ -34,8 +34,8 @@ SeaderUhfTidView seader_uhf_classify_tid_view(const uint8_t* tid, size_t tid_len
     return SeaderUhfTidViewUnknown;
 }
 
-SeaderUhfPrivateReadPlan seader_uhf_plan_private_read(
-    bool have_access_password, bool qt_known, uint16_t qt_control) {
+SeaderUhfPrivateReadPlan
+    seader_uhf_plan_private_read(bool have_access_password, bool qt_known, uint16_t qt_control) {
     SeaderUhfPrivateReadPlan plan = {0};
 
     if(!have_access_password) return plan;

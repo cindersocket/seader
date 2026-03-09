@@ -88,10 +88,10 @@ const char* seader_credential_get_type_label(const SeaderCredential* cred) {
             return "PicoPass";
         case SeaderPacsMediaTypeMifarePlus:
             return "MIFARE Plus";
-    case SeaderPacsMediaTypeSeos:
-        return "Seos";
-    case SeaderPacsMediaTypeUhf:
-        return "UHF";
+        case SeaderPacsMediaTypeSeos:
+            return "Seos";
+        case SeaderPacsMediaTypeUhf:
+            return "UHF";
         }
     }
 

@@ -133,7 +133,8 @@ static size_t seader_worker_detect_supported_types(
         }
     }
 
-    if(seader->read_scope != SeaderReadScopeHF && seader->uhf && seader_uhf_is_available(seader->uhf)) {
+    if(seader->read_scope != SeaderReadScopeHF && seader->uhf &&
+       seader_uhf_is_available(seader->uhf)) {
         seader_worker_add_detected_type(
             detected_types, &detected_type_count, SeaderCredentialTypeUhf);
     }
@@ -144,6 +145,12 @@ static size_t seader_worker_detect_supported_types(
 static bool seader_worker_start_read_for_uhf(Seader* seader) {
     SeaderUhfReadResult result = {0};
     if(!seader->uhf || !seader_uhf_inventory_tag(seader->uhf, &result)) {
+        FURI_LOG_W(
+            TAG,
+            "UHF inventory failed mode=%d read_scope=%d selected=%d",
+            seader->uhf_read_mode,
+            seader->read_scope,
+            seader->selected_read_type);
         return false;
     }
 
@@ -154,6 +161,7 @@ static bool seader_worker_start_read_for_uhf(Seader* seader) {
 
     if(seader->uhf_read_mode == SeaderUhfReadModeEpc) {
         size_t copy_len = result.tag.epc_len;
+        FURI_LOG_I(TAG, "UHF EPC read epc_len=%u", (unsigned)copy_len);
         if(copy_len > sizeof(seader->uhf_result_data)) copy_len = sizeof(seader->uhf_result_data);
         memcpy(seader->uhf_result_data, result.tag.epc, copy_len);
         seader->uhf_result_len = copy_len;
@@ -164,6 +172,7 @@ static bool seader_worker_start_read_for_uhf(Seader* seader) {
 
     if(seader->uhf_read_mode == SeaderUhfReadModeTid) {
         size_t copy_len = result.tag.public_tid_len;
+        FURI_LOG_I(TAG, "UHF TID read tid_len=%u", (unsigned)copy_len);
         if(copy_len > sizeof(seader->uhf_result_data)) copy_len = sizeof(seader->uhf_result_data);
         memcpy(seader->uhf_result_data, result.tag.public_tid, copy_len);
         seader->uhf_result_len = copy_len;
@@ -186,9 +195,15 @@ static bool seader_worker_start_read_for_uhf(Seader* seader) {
     }
 
     if(result.tag.sam_csn_len > 0U) {
+        FURI_LOG_I(
+            TAG,
+            "UHF SIO send cardDetected sam_csn_len=%u epc_len=%u",
+            (unsigned)result.tag.sam_csn_len,
+            (unsigned)result.tag.epc_len);
         return seader_send_uhf_card_detected(seader, result.tag.sam_csn, result.tag.sam_csn_len);
     }
 
+    FURI_LOG_I(TAG, "UHF SIO send cardDetected epc_len=%u", (unsigned)result.tag.epc_len);
     return seader_send_uhf_card_detected(seader, result.tag.epc, result.tag.epc_len);
 }
 

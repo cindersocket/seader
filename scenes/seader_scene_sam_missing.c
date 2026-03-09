@@ -3,6 +3,7 @@ enum SubmenuIndex {
     SubmenuIndexDetectSam,
     SubmenuIndexReadUhf,
     SubmenuIndexSaved,
+    SubmenuIndexNoUhfHwSam,
 };
 
 void seader_scene_sam_missing_submenu_callback(void* context, uint32_t index) {
@@ -14,7 +15,6 @@ void seader_scene_sam_missing_on_enter(void* context) {
     Seader* seader = context;
 
     if(seader->uhf) {
-        seader_uhf_end(seader->uhf);
         seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
     }
 
@@ -32,6 +32,13 @@ void seader_scene_sam_missing_on_enter(void* context) {
             submenu,
             "Read UHF",
             SubmenuIndexReadUhf,
+            seader_scene_sam_missing_submenu_callback,
+            seader);
+    } else {
+        submenu_add_item(
+            submenu,
+            "No UHF HW/SAM",
+            SubmenuIndexNoUhfHwSam,
             seader_scene_sam_missing_submenu_callback,
             seader);
     }
@@ -58,6 +65,8 @@ bool seader_scene_sam_missing_on_event(void* context, SceneManagerEvent event) {
             consumed = true;
         } else if(event.event == SubmenuIndexReadUhf) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
+            consumed = true;
+        } else if(event.event == SubmenuIndexNoUhfHwSam) {
             consumed = true;
         } else if(event.event == SubmenuIndexSaved) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneFileSelect);

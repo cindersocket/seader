@@ -2,8 +2,9 @@
 enum SubmenuIndex {
     SubmenuIndexReadHF,
     SubmenuIndexReadUHF,
-    SubmenuIndexIce1803Sam,
     SubmenuIndexSaved,
+    SubmenuIndexIce1803Sam,
+    SubmenuIndexNoUhfHwSam,
     SubmenuIndexAPDURunner,
     SubmenuIndexSamInfo,
     SubmenuIndexFwVersion,
@@ -15,6 +16,13 @@ static uint8_t fwChecks = 3;
 static bool seader_scene_sam_present_should_show_read_uhf(const Seader* seader) {
     if(!seader || !seader->worker) return false;
     return seader_uhf_should_show_root_menu(
+        seader->uhf && seader_uhf_is_available(seader->uhf),
+        (SeaderUhfSamSupport)seader->worker->uhf_sam_support);
+}
+
+static bool seader_scene_sam_present_should_show_no_uhf_hw_sam(const Seader* seader) {
+    if(!seader || !seader->worker) return false;
+    return seader_uhf_should_show_root_unavailable(
         seader->uhf && seader_uhf_is_available(seader->uhf),
         (SeaderUhfSamSupport)seader->worker->uhf_sam_support);
 }
@@ -41,6 +49,8 @@ void seader_scene_sam_present_on_update(void* context) {
             seader_scene_sam_present_submenu_callback,
             seader);
     }
+    submenu_add_item(
+        submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_present_submenu_callback, seader);
     if(seader->sam_is_ice1803) {
         submenu_add_item(
             submenu,
@@ -49,8 +59,14 @@ void seader_scene_sam_present_on_update(void* context) {
             seader_scene_sam_present_submenu_callback,
             seader);
     }
-    submenu_add_item(
-        submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_present_submenu_callback, seader);
+    if(seader_scene_sam_present_should_show_no_uhf_hw_sam(seader)) {
+        submenu_add_item(
+            submenu,
+            "No UHF HW/SAM",
+            SubmenuIndexNoUhfHwSam,
+            seader_scene_sam_present_submenu_callback,
+            seader);
+    }
 
     if(seader->is_debug_enabled) {
         submenu_add_item(
@@ -94,7 +110,6 @@ void seader_scene_sam_present_on_update(void* context) {
 void seader_scene_sam_present_on_enter(void* context) {
     Seader* seader = context;
     if(seader->uhf) {
-        seader_uhf_end(seader->uhf);
         seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
     }
     seader_scene_sam_present_on_update(context);
@@ -118,10 +133,18 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
             consumed = true;
         } else if(event.event == SubmenuIndexReadUHF) {
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
+            if(seader_uhf_root_leads_to_no_module(
+                   seader->uhf && seader_uhf_is_available(seader->uhf),
+                   seader->uhf_sam_support)) {
+                scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfNoModule);
+            } else {
+                scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
+            }
             consumed = true;
         } else if(event.event == SubmenuIndexIce1803Sam) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneSamInfo);
+            consumed = true;
+        } else if(event.event == SubmenuIndexNoUhfHwSam) {
             consumed = true;
         } else if(event.event == SubmenuIndexReadConfigCard) {
             scene_manager_set_scene_state(

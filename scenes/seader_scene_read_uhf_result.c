@@ -18,7 +18,8 @@ void seader_scene_read_uhf_result_on_enter(void* context) {
     FuriString* line3 = seader->temp_string3;
 
     widget_reset(widget);
-    furi_string_printf(line1, "UHF %s", seader->uhf_result_label[0] ? seader->uhf_result_label : "Data");
+    furi_string_printf(
+        line1, "UHF %s", seader->uhf_result_label[0] ? seader->uhf_result_label : "Data");
     furi_string_reset(line2);
     furi_string_reset(line3);
 

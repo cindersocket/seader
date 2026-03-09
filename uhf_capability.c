@@ -6,6 +6,14 @@ bool seader_uhf_should_show_root_menu(bool module_present, SeaderUhfSamSupport s
     return module_present || sam_support == SeaderUhfSamSupportSupported;
 }
 
+bool seader_uhf_should_show_root_unavailable(bool module_present, SeaderUhfSamSupport sam_support) {
+    return !module_present && sam_support == SeaderUhfSamSupportUnavailable;
+}
+
+bool seader_uhf_root_leads_to_no_module(bool module_present, SeaderUhfSamSupport sam_support) {
+    return !module_present && sam_support == SeaderUhfSamSupportSupported;
+}
+
 const char* seader_uhf_sio_menu_label(bool sam_present, SeaderUhfSamSupport sam_support) {
     if(!sam_present) return "No SAM";
 
@@ -44,7 +52,8 @@ SeaderUhfSnmpProbeResult
         return SeaderUhfSnmpProbeProtected;
     }
 
-    if(error_code == 0x11U && len >= 2U && d0 == 0x2EU && d1 == 0x00U) {
+    if(error_code == 0x11U && len >= 2U &&
+       ((d0 == 0x2EU && d1 == 0x00U) || (d0 == 0x39U && d1 == 0x00U))) {
         return SeaderUhfSnmpProbeMissing;
     }
 

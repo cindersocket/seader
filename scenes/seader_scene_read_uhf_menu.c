@@ -6,6 +6,15 @@ enum SubmenuIndex {
     SubmenuIndexTid,
 };
 
+static void seader_scene_read_uhf_menu_start_mode(Seader* seader, SeaderUhfReadMode mode) {
+    furi_assert(seader);
+
+    seader->read_scope = SeaderReadScopeUHF;
+    seader->selected_read_type = SeaderCredentialTypeUhf;
+    seader->uhf_read_mode = mode;
+    scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+}
+
 static const char* seader_scene_read_uhf_menu_sio_label(const Seader* seader) {
     return seader_uhf_sio_menu_label(seader->sam_present, seader->uhf_sam_support);
 }
@@ -55,22 +64,13 @@ bool seader_scene_read_uhf_menu_on_event(void* context, SceneManagerEvent event)
         if(event.event == SubmenuIndexSio) {
             consumed = true;
             if(seader_scene_read_uhf_menu_sio_enabled(seader)) {
-                seader->read_scope = SeaderReadScopeUHF;
-                seader->selected_read_type = SeaderCredentialTypeUhf;
-                seader->uhf_read_mode = SeaderUhfReadModeSio;
-                scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+                seader_scene_read_uhf_menu_start_mode(seader, SeaderUhfReadModeSio);
             }
         } else if(event.event == SubmenuIndexEpc) {
-            seader->read_scope = SeaderReadScopeUHF;
-            seader->selected_read_type = SeaderCredentialTypeUhf;
-            seader->uhf_read_mode = SeaderUhfReadModeEpc;
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+            seader_scene_read_uhf_menu_start_mode(seader, SeaderUhfReadModeEpc);
             consumed = true;
         } else if(event.event == SubmenuIndexTid) {
-            seader->read_scope = SeaderReadScopeUHF;
-            seader->selected_read_type = SeaderCredentialTypeUhf;
-            seader->uhf_read_mode = SeaderUhfReadModeTid;
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+            seader_scene_read_uhf_menu_start_mode(seader, SeaderUhfReadModeTid);
             consumed = true;
         } else if(event.event == SeaderCustomEventSamStatusUpdated) {
             seader_scene_read_uhf_menu_on_enter(seader);
@@ -81,7 +81,6 @@ bool seader_scene_read_uhf_menu_on_event(void* context, SceneManagerEvent event)
         seader->read_scope = SeaderReadScopeAll;
         seader->uhf_read_mode = SeaderUhfReadModeNone;
         if(seader->uhf) {
-            seader_uhf_end(seader->uhf);
             seader->worker->uhf_module_present = seader_uhf_is_available(seader->uhf);
         }
         consumed = scene_manager_previous_scene(seader->scene_manager);

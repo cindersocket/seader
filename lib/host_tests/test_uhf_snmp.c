@@ -8,7 +8,7 @@ static const char* snmp_discovery_request_hex =
     "3038020103300E020100020202F4040104020201010410300E0400020100020100040004000400301104000400A00B0201000201000201003000";
 
 static const char* snmp_discovery_response_hex =
-    "308200A80201033082000E02010002010004020000020201010482003A30820036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020101040D2B0601040181E438010104080F0400040030820051041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F040D2B0601040181E438010104080FA08200210201000201000201003082001430820010060A2B060106030F010104000202013E";
+    "308200A80201033082000E02010002010004020000020201010482003A30820036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020101040D2B0601040181E438010104080F0400040030820051041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F040D2B0601040181E438010104080FA08200210201000201000201003082001430820010060A2B060106030F0101040002020141";
 
 static const char* snmp_ice_response_hex =
     "308200A80201033082000E02010002010004020000020201010482003A30820036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020102040D2B0601040181E438010104080F0400040030820051041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F040D2B0601040181E438010104080FA2820021020100020100020100308200143082001006050301070138040749434531383033";
@@ -16,8 +16,27 @@ static const char* snmp_ice_response_hex =
 static const char* snmp_uhf_config_response_hex =
     "308200F40201033082000E02010002010004020000020201010482003A30820036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020103040D2B0601040181E438010104080F040004003082009D041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F040D2B0601040181E438010104080FA282006D020100020100020100308200603082005C0606030107030B00045204E2003412112B0601040181E438010102012201010101112B0601040181E43801010201220101020104E2801105112B0601040181E438010102011E01010101112B0601040181E438010102011E01010201";
 
+static const char* snmp_ice_request_hex =
+    "307A020103300E020100020202F40401040202010104383036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020101040D2B0601040181E438010104080F04000400302B04000400A025020100020100020100301A30180604030003060410300E0605030107013802010002020100";
+
+static const char* snmp_monza_request_hex =
+    "308186020103300E020100020202F40401040202010104383036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020101040D2B0601040181E438010104080F04000400303704000400A03102010002010002010030263024060403000306041C301A06112B0601040181E438010102011E0101010102010002020100";
+
+static const char* snmp_higgs_request_hex =
+    "308186020103300E020100020202F40401040202010104383036041B2B0601040181E438010103050F8C9088CDA2A8D885C0B298D7FF7F020105020101040D2B0601040181E438010104080F04000400303704000400A03102010002010002010030263024060403000306041C301A06112B0601040181E43801010201220101010102010002020100";
+
 static const uint8_t oid_elite_ice[] = {0x03, 0x01, 0x07, 0x01, 0x38};
 static const uint8_t oid_uhf_tags_config[] = {0x03, 0x01, 0x07, 0x03, 0x0B, 0x00};
+static const uint8_t oid_monza4qt_access_key[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x02, 0x01, 0x1E, 0x01, 0x01, 0x01, 0x01};
+static const uint8_t oid_higgs3_access_key[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x02, 0x01, 0x22, 0x01, 0x01, 0x01, 0x01};
+static const uint8_t live_engine_id[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x03,
+    0x05, 0x0F, 0x8C, 0x90, 0x88, 0xCD, 0xA2, 0xA8, 0xD8, 0x85, 0xC0,
+    0xB2, 0x98, 0xD7, 0xFF, 0x7F};
+static const uint8_t live_username[] = {
+    0x2B, 0x06, 0x01, 0x04, 0x01, 0x81, 0xE4, 0x38, 0x01, 0x01, 0x04, 0x08, 0x0F};
 
 static size_t test_hex_to_bytes(const char* hex, uint8_t* out, size_t out_size) {
     size_t len = 0U;
@@ -62,12 +81,107 @@ static MunitResult test_build_discovery_request_matches_live_vector(
     (void)fixture;
 
     uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t scratch[SEADER_SNMP_MAX_MSG_LEN] = {0};
     uint8_t expected[SEADER_SNMP_MAX_MSG_LEN] = {0};
     size_t message_len = 0U;
     size_t expected_len = test_hex_to_bytes(snmp_discovery_request_hex, expected, sizeof(expected));
 
     munit_assert_true(
-        seader_uhf_snmp_build_discovery_request(message, sizeof(message), &message_len));
+        seader_uhf_snmp_build_discovery_request(
+            scratch, sizeof(scratch), message, sizeof(message), &message_len));
+    munit_assert_size(message_len, ==, expected_len);
+    munit_assert_memory_equal(expected_len, message, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_ice_request_matches_live_vector(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t scratch[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t expected[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    size_t message_len = 0U;
+    size_t expected_len = test_hex_to_bytes(snmp_ice_request_hex, expected, sizeof(expected));
+
+    munit_assert_true(seader_uhf_snmp_build_get_data_request(
+        live_engine_id,
+        sizeof(live_engine_id),
+        live_username,
+        sizeof(live_username),
+        5U,
+        1U,
+        oid_elite_ice,
+        sizeof(oid_elite_ice),
+        scratch,
+        sizeof(scratch),
+        message,
+        sizeof(message),
+        &message_len));
+    munit_assert_size(message_len, ==, expected_len);
+    munit_assert_memory_equal(expected_len, message, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_monza_request_matches_live_vector(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t scratch[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t expected[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    size_t message_len = 0U;
+    size_t expected_len = test_hex_to_bytes(snmp_monza_request_hex, expected, sizeof(expected));
+
+    munit_assert_true(seader_uhf_snmp_build_get_data_request(
+        live_engine_id,
+        sizeof(live_engine_id),
+        live_username,
+        sizeof(live_username),
+        5U,
+        1U,
+        oid_monza4qt_access_key,
+        sizeof(oid_monza4qt_access_key),
+        scratch,
+        sizeof(scratch),
+        message,
+        sizeof(message),
+        &message_len));
+    munit_assert_size(message_len, ==, expected_len);
+    munit_assert_memory_equal(expected_len, message, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_higgs_request_matches_live_vector(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    uint8_t message[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t scratch[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    uint8_t expected[SEADER_SNMP_MAX_MSG_LEN] = {0};
+    size_t message_len = 0U;
+    size_t expected_len = test_hex_to_bytes(snmp_higgs_request_hex, expected, sizeof(expected));
+
+    munit_assert_true(seader_uhf_snmp_build_get_data_request(
+        live_engine_id,
+        sizeof(live_engine_id),
+        live_username,
+        sizeof(live_username),
+        5U,
+        1U,
+        oid_higgs3_access_key,
+        sizeof(oid_higgs3_access_key),
+        scratch,
+        sizeof(scratch),
+        message,
+        sizeof(message),
+        &message_len));
     munit_assert_size(message_len, ==, expected_len);
     munit_assert_memory_equal(expected_len, message, expected);
     return MUNIT_OK;
@@ -166,6 +280,9 @@ static MunitResult test_parse_uhf_config_response_extracts_value(
 
 static MunitTest test_uhf_snmp_cases[] = {
     {(char*)"/build-discovery", test_build_discovery_request_matches_live_vector, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/build-ice-request", test_build_ice_request_matches_live_vector, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/build-monza-request", test_build_monza_request_matches_live_vector, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/build-higgs-request", test_build_higgs_request_matches_live_vector, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/parse-discovery", test_parse_discovery_response_extracts_usm_context, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/parse-ice", test_parse_ice_response_extracts_value, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/parse-uhf-config", test_parse_uhf_config_response_extracts_value, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},

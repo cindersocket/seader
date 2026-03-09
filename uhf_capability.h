@@ -24,6 +24,8 @@ typedef enum {
 } SeaderUhfReadMode;
 
 bool seader_uhf_should_show_root_menu(bool module_present, SeaderUhfSamSupport sam_support);
+bool seader_uhf_should_show_root_unavailable(bool module_present, SeaderUhfSamSupport sam_support);
+bool seader_uhf_root_leads_to_no_module(bool module_present, SeaderUhfSamSupport sam_support);
 const char* seader_uhf_sio_menu_label(bool sam_present, SeaderUhfSamSupport sam_support);
 bool seader_uhf_sio_menu_enabled(bool sam_present, SeaderUhfSamSupport sam_support);
 bool seader_uhf_read_mode_is_raw_result(SeaderUhfReadMode mode);

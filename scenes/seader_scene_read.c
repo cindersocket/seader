@@ -9,21 +9,24 @@ static bool seader_scene_read_is_uhf(const Seader* seader) {
 
 void seader_scene_read_on_enter(void* context) {
     Seader* seader = context;
+    const bool is_uhf = seader_scene_read_is_uhf(seader);
+
+    if(is_uhf && seader->uhf_read_mode == SeaderUhfReadModeNone) {
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneReadUhfMenu);
+        return;
+    }
+
     dolphin_deed(DolphinDeedNfcRead);
 
     // Setup view
     Popup* popup = seader->popup;
-    const bool is_uhf = seader_scene_read_is_uhf(seader);
     if(is_uhf) {
         popup_set_header(popup, NULL, 0, 0, AlignLeft, AlignTop);
     } else {
         popup_set_header(popup, "Detecting\nHF card...", 68, 30, AlignLeft, AlignTop);
     }
     popup_set_icon(
-        popup,
-        0,
-        3,
-        is_uhf ? &I_RFIDDolphinReceiveUHF_97x61 : &I_RFIDDolphinReceive_97x61);
+        popup, 0, 3, is_uhf ? &I_RFIDDolphinReceiveUHF_97x61 : &I_RFIDDolphinReceive_97x61);
 
     // Start worker
     view_dispatcher_switch_to_view(seader->view_dispatcher, SeaderViewPopup);

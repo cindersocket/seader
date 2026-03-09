@@ -38,11 +38,8 @@ static bool seader_der_read_length(
     return true;
 }
 
-static bool seader_der_read_tlv(
-    const uint8_t* data,
-    size_t data_len,
-    size_t* offset,
-    SeaderDerTlv* tlv) {
+static bool
+    seader_der_read_tlv(const uint8_t* data, size_t data_len, size_t* offset, SeaderDerTlv* tlv) {
     if(!data || !offset || !tlv || *offset >= data_len) return false;
 
     tlv->tag = data[(*offset)++];
@@ -113,7 +110,8 @@ bool seader_uhf_routed_try_parse_apdu(
     if(i2c_tlv.tag != SEADER_DER_TAG_I2C_COMMAND) return false;
 
     size_t i2c_offset = 0U;
-    if(!seader_der_read_tlv(i2c_tlv.value, i2c_tlv.len, &i2c_offset, &i2c_header_tlv)) return false;
+    if(!seader_der_read_tlv(i2c_tlv.value, i2c_tlv.len, &i2c_offset, &i2c_header_tlv))
+        return false;
     if(i2c_header_tlv.tag != SEADER_DER_TAG_OCTET_STRING || i2c_header_tlv.len != 6U) return false;
 
     if(!seader_der_read_tlv(i2c_tlv.value, i2c_tlv.len, &i2c_offset, &bus_addr_tlv)) return false;
@@ -121,7 +119,8 @@ bool seader_uhf_routed_try_parse_apdu(
     uint32_t bus_addr = 0U;
     if(!seader_der_parse_positive_integer(&bus_addr_tlv, &bus_addr)) return false;
 
-    if(!seader_der_read_tlv(i2c_tlv.value, i2c_tlv.len, &i2c_offset, &nested_payload_tlv)) return false;
+    if(!seader_der_read_tlv(i2c_tlv.value, i2c_tlv.len, &i2c_offset, &nested_payload_tlv))
+        return false;
     if(nested_payload_tlv.tag != SEADER_DER_TAG_UHF_PAYLOAD) return false;
 
     uint8_t command_tag = 0U;
@@ -130,8 +129,8 @@ bool seader_uhf_routed_try_parse_apdu(
 
     size_t uhf_offset = 0U;
     SeaderDerTlv command_tlv = {0};
-    bool command_tlv_ok =
-        seader_der_read_tlv(nested_payload_tlv.value, nested_payload_tlv.len, &uhf_offset, &command_tlv);
+    bool command_tlv_ok = seader_der_read_tlv(
+        nested_payload_tlv.value, nested_payload_tlv.len, &uhf_offset, &command_tlv);
 
     if(command_tlv_ok) {
         command_tag = command_tlv.tag;
@@ -145,7 +144,8 @@ bool seader_uhf_routed_try_parse_apdu(
             trailing = i2c_tlv.value + i2c_offset;
         }
 
-        if(nested_payload_tlv.len == 2U && nested_payload_tlv.value && trailing && trailing_len > 0U) {
+        if(nested_payload_tlv.len == 2U && nested_payload_tlv.value && trailing &&
+           trailing_len > 0U) {
             uint8_t recovered_tag = nested_payload_tlv.value[0];
             uint8_t recovered_len = nested_payload_tlv.value[1];
             if(((recovered_tag & 0xC0U) == 0x80U) && recovered_len == trailing_len) {

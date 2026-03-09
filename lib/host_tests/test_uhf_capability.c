@@ -11,6 +11,10 @@ static MunitResult test_root_menu_hidden_without_module_or_sam_support(
         seader_uhf_should_show_root_menu(false, SeaderUhfSamSupportUnknown));
     munit_assert_false(
         seader_uhf_should_show_root_menu(false, SeaderUhfSamSupportUnavailable));
+    munit_assert_false(
+        seader_uhf_root_leads_to_no_module(false, SeaderUhfSamSupportUnavailable));
+    munit_assert_true(
+        seader_uhf_should_show_root_unavailable(false, SeaderUhfSamSupportUnavailable));
     return MUNIT_OK;
 }
 
@@ -22,6 +26,10 @@ static MunitResult test_root_menu_shown_for_module_only(
 
     munit_assert_true(
         seader_uhf_should_show_root_menu(true, SeaderUhfSamSupportUnavailable));
+    munit_assert_false(
+        seader_uhf_should_show_root_unavailable(true, SeaderUhfSamSupportUnavailable));
+    munit_assert_false(
+        seader_uhf_root_leads_to_no_module(true, SeaderUhfSamSupportUnavailable));
     return MUNIT_OK;
 }
 
@@ -33,6 +41,24 @@ static MunitResult test_root_menu_shown_for_sam_support_only(
 
     munit_assert_true(
         seader_uhf_should_show_root_menu(false, SeaderUhfSamSupportSupported));
+    munit_assert_false(
+        seader_uhf_should_show_root_unavailable(false, SeaderUhfSamSupportSupported));
+    munit_assert_true(
+        seader_uhf_root_leads_to_no_module(false, SeaderUhfSamSupportSupported));
+    return MUNIT_OK;
+}
+
+static MunitResult test_root_menu_module_and_sam_support_prefers_read_menu(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    munit_assert_true(seader_uhf_should_show_root_menu(true, SeaderUhfSamSupportSupported));
+    munit_assert_false(
+        seader_uhf_should_show_root_unavailable(true, SeaderUhfSamSupportSupported));
+    munit_assert_false(
+        seader_uhf_root_leads_to_no_module(true, SeaderUhfSamSupportSupported));
     return MUNIT_OK;
 }
 
@@ -143,7 +169,21 @@ static MunitResult test_probe_error_classifies_protected_3800(
     return MUNIT_OK;
 }
 
-static MunitResult test_probe_error_classifies_missing_2e00(
+static MunitResult test_probe_error_classifies_missing_3900(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    const uint8_t data[] = {0x39U, 0x00U};
+    munit_assert_int(
+        seader_uhf_snmp_classify_probe_error(0x11U, data, sizeof(data)),
+        ==,
+        SeaderUhfSnmpProbeMissing);
+    return MUNIT_OK;
+}
+
+static MunitResult test_probe_error_classifies_missing_2e00_legacy(
     const MunitParameter params[],
     void* fixture) {
     (void)params;
@@ -194,6 +234,7 @@ static MunitTest test_uhf_capability_cases[] = {
     {(char*)"/root-hidden", test_root_menu_hidden_without_module_or_sam_support, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/root-module-only", test_root_menu_shown_for_module_only, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/root-sam-only", test_root_menu_shown_for_sam_support_only, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/root-module-and-sam", test_root_menu_module_and_sam_support_prefers_read_menu, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/sio-no-sam", test_sio_label_without_sam, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/sio-unknown", test_sio_label_when_support_unknown, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/sio-missing", test_sio_label_when_support_missing, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
@@ -203,7 +244,8 @@ static MunitTest test_uhf_capability_cases[] = {
     {(char*)"/key-probe-missing", test_sam_support_from_missing_key_probe, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/probe-protected-6982", test_probe_error_classifies_protected_6982, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/probe-protected-3800", test_probe_error_classifies_protected_3800, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
-    {(char*)"/probe-missing-2e00", test_probe_error_classifies_missing_2e00, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/probe-missing-3900", test_probe_error_classifies_missing_3900, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/probe-missing-2e00-legacy", test_probe_error_classifies_missing_2e00_legacy, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/probe-unexpected", test_probe_error_classifies_unexpected, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/elite-ice1803-match", test_elite_ice1803_match, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/elite-ice1803-mismatch", test_elite_ice1803_mismatch, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},

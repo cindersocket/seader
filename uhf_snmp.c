@@ -8,11 +8,8 @@ typedef struct {
     size_t len;
 } SeaderUhfSnmpTlv;
 
-static bool seader_uhf_snmp_append_len(
-    uint8_t* dst,
-    size_t dst_size,
-    size_t* offset,
-    size_t value_len) {
+static bool
+    seader_uhf_snmp_append_len(uint8_t* dst, size_t dst_size, size_t* offset, size_t value_len) {
     if(value_len < 0x80U) {
         if(*offset + 1U > dst_size) return false;
         dst[(*offset)++] = (uint8_t)value_len;
@@ -51,11 +48,8 @@ static bool seader_uhf_snmp_append_tlv(
     return true;
 }
 
-static bool seader_uhf_snmp_append_uint32(
-    uint8_t* dst,
-    size_t dst_size,
-    size_t* offset,
-    uint32_t value) {
+static bool
+    seader_uhf_snmp_append_uint32(uint8_t* dst, size_t dst_size, size_t* offset, uint32_t value) {
     uint8_t encoded[5] = {0};
     size_t encoded_len = 0U;
 
@@ -76,6 +70,36 @@ static bool seader_uhf_snmp_append_uint32(
     prefixed_len += encoded_len;
 
     return seader_uhf_snmp_append_tlv(dst, dst_size, offset, 0x02U, prefixed, prefixed_len);
+}
+
+static bool seader_uhf_snmp_wrap_tlv_inplace(
+    uint8_t* buffer,
+    size_t buffer_capacity,
+    size_t value_len,
+    uint8_t tag,
+    size_t* encoded_len) {
+    size_t header_len = 2U;
+
+    if(!buffer || !encoded_len) return false;
+
+    if(value_len >= 0x80U && value_len <= 0xFFU) {
+        header_len = 3U;
+    } else if(value_len > 0xFFU && value_len <= 0xFFFFU) {
+        header_len = 4U;
+    } else if(value_len > 0xFFFFU) {
+        return false;
+    }
+
+    if(header_len + value_len > buffer_capacity) return false;
+
+    memmove(buffer + header_len, buffer, value_len);
+    buffer[0] = tag;
+
+    size_t offset = 1U;
+    if(!seader_uhf_snmp_append_len(buffer, buffer_capacity, &offset, value_len)) return false;
+
+    *encoded_len = offset + value_len;
+    return true;
 }
 
 static bool seader_uhf_snmp_next_tlv(
@@ -129,36 +153,17 @@ static bool seader_uhf_snmp_build_get_data_payload(
     uint8_t* payload,
     size_t payload_capacity,
     size_t* payload_len) {
-    uint8_t sequence_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t sequence_value_len = 0U;
-
     if(!target_oid || target_oid_len == 0U || !payload || !payload_len) return false;
     if(!seader_uhf_snmp_append_tlv(
-           sequence_value,
-           sizeof(sequence_value),
-           &sequence_value_len,
-           0x06U,
-           target_oid,
-           target_oid_len))
+           payload, payload_capacity, payload_len, 0x06U, target_oid, target_oid_len))
         return false;
-    if(!seader_uhf_snmp_append_uint32(
-           sequence_value, sizeof(sequence_value), &sequence_value_len, offset_value))
+    if(!seader_uhf_snmp_append_uint32(payload, payload_capacity, payload_len, offset_value))
         return false;
-    if(!seader_uhf_snmp_append_uint32(
-           sequence_value, sizeof(sequence_value), &sequence_value_len, max_chunk_len))
+    if(!seader_uhf_snmp_append_uint32(payload, payload_capacity, payload_len, max_chunk_len))
         return false;
 
-    size_t encoded_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           payload,
-           payload_capacity,
-           &encoded_len,
-           0x30U,
-           sequence_value,
-           sequence_value_len))
-        return false;
-    *payload_len = encoded_len;
-    return true;
+    return seader_uhf_snmp_wrap_tlv_inplace(
+        payload, payload_capacity, *payload_len, 0x30U, payload_len);
 }
 
 static bool seader_uhf_snmp_build_reportable_get_request(
@@ -172,171 +177,96 @@ static bool seader_uhf_snmp_build_reportable_get_request(
     size_t data_oid_len,
     const uint8_t* data,
     size_t data_len,
+    uint8_t* scratch,
+    size_t scratch_capacity,
     uint8_t* message,
     size_t message_capacity,
     size_t* message_len) {
-    uint8_t varbind_pair[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t varbind_pair_len = 0U;
+    size_t scratch_len = 0U;
+    size_t scoped_pdu_len = 0U;
+    uint8_t global_data_value[16] = {0};
+    uint8_t global_data[24] = {0};
+    uint8_t version[8] = {0};
+    size_t global_data_value_len = 0U;
+    size_t global_data_len = 0U;
+    size_t version_len = 0U;
+    uint8_t flags[] = {0x04U};
 
-    if(!message || !message_len) return false;
+    if(!scratch || !message || !message_len) return false;
+    *message_len = 0U;
 
     if(data_oid && data_oid_len > 0U) {
-        uint8_t varbind_pair_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-        size_t varbind_pair_value_len = 0U;
         if(!seader_uhf_snmp_append_tlv(
-               varbind_pair_value,
-               sizeof(varbind_pair_value),
-               &varbind_pair_value_len,
-               0x06U,
-               data_oid,
-               data_oid_len))
+               scratch, scratch_capacity, &scratch_len, 0x06U, data_oid, data_oid_len))
             return false;
         if(!seader_uhf_snmp_append_tlv(
-               varbind_pair_value,
-               sizeof(varbind_pair_value),
-               &varbind_pair_value_len,
-               0x04U,
-               data,
-               data_len))
+               scratch, scratch_capacity, &scratch_len, 0x04U, data, data_len))
             return false;
-        if(!seader_uhf_snmp_append_tlv(
-               varbind_pair,
-               sizeof(varbind_pair),
-               &varbind_pair_len,
-               0x30U,
-               varbind_pair_value,
-               varbind_pair_value_len))
+        if(!seader_uhf_snmp_wrap_tlv_inplace(
+               scratch, scratch_capacity, scratch_len, 0x30U, &scratch_len))
             return false;
     }
 
-    uint8_t varbind_sequence[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t varbind_sequence_len = 0U;
+    memcpy(message, scratch, scratch_len);
+    *message_len = scratch_len;
+    if(!seader_uhf_snmp_wrap_tlv_inplace(
+           message, message_capacity, *message_len, 0x30U, message_len))
+        return false;
+
+    scratch_len = 0U;
+    if(!seader_uhf_snmp_append_uint32(scratch, scratch_capacity, &scratch_len, 0U) ||
+       !seader_uhf_snmp_append_uint32(scratch, scratch_capacity, &scratch_len, 0U) ||
+       !seader_uhf_snmp_append_uint32(scratch, scratch_capacity, &scratch_len, 0U))
+        return false;
+    if(scratch_len + *message_len > scratch_capacity) return false;
+    memcpy(scratch + scratch_len, message, *message_len);
+    scratch_len += *message_len;
+    if(!seader_uhf_snmp_wrap_tlv_inplace(
+           scratch, scratch_capacity, scratch_len, 0xA0U, &scratch_len))
+        return false;
+
+    *message_len = 0U;
+    if(!seader_uhf_snmp_append_tlv(message, message_capacity, message_len, 0x04U, NULL, 0U) ||
+       !seader_uhf_snmp_append_tlv(message, message_capacity, message_len, 0x04U, NULL, 0U))
+        return false;
+    if(*message_len + scratch_len > message_capacity) return false;
+    memcpy(message + *message_len, scratch, scratch_len);
+    *message_len += scratch_len;
+    if(!seader_uhf_snmp_wrap_tlv_inplace(
+           message, message_capacity, *message_len, 0x30U, &scoped_pdu_len))
+        return false;
+
+    scratch_len = 0U;
     if(!seader_uhf_snmp_append_tlv(
-           varbind_sequence,
-           sizeof(varbind_sequence),
-           &varbind_sequence_len,
-           0x30U,
-           varbind_pair,
-           varbind_pair_len))
-        return false;
-
-    uint8_t pdu_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t pdu_value_len = 0U;
-    if(!seader_uhf_snmp_append_uint32(pdu_value, sizeof(pdu_value), &pdu_value_len, 0U) ||
-       !seader_uhf_snmp_append_uint32(pdu_value, sizeof(pdu_value), &pdu_value_len, 0U) ||
-       !seader_uhf_snmp_append_uint32(pdu_value, sizeof(pdu_value), &pdu_value_len, 0U)) {
-        return false;
-    }
-    if(pdu_value_len + varbind_sequence_len > sizeof(pdu_value)) return false;
-    memcpy(pdu_value + pdu_value_len, varbind_sequence, varbind_sequence_len);
-    pdu_value_len += varbind_sequence_len;
-
-    uint8_t pdu[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t pdu_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(pdu, sizeof(pdu), &pdu_len, 0xA0U, pdu_value, pdu_value_len))
-        return false;
-
-    uint8_t scoped_pdu_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t scoped_pdu_value_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           scoped_pdu_value, sizeof(scoped_pdu_value), &scoped_pdu_value_len, 0x04U, NULL, 0U) ||
+           scratch, scratch_capacity, &scratch_len, 0x04U, engine_id, engine_id_len) ||
+       !seader_uhf_snmp_append_uint32(scratch, scratch_capacity, &scratch_len, engine_boots) ||
+       !seader_uhf_snmp_append_uint32(scratch, scratch_capacity, &scratch_len, engine_time) ||
        !seader_uhf_snmp_append_tlv(
-           scoped_pdu_value, sizeof(scoped_pdu_value), &scoped_pdu_value_len, 0x04U, NULL, 0U)) {
+           scratch, scratch_capacity, &scratch_len, 0x04U, user_name, user_name_len) ||
+       !seader_uhf_snmp_append_tlv(scratch, scratch_capacity, &scratch_len, 0x04U, NULL, 0U) ||
+       !seader_uhf_snmp_append_tlv(scratch, scratch_capacity, &scratch_len, 0x04U, NULL, 0U))
         return false;
-    }
-    if(scoped_pdu_value_len + pdu_len > sizeof(scoped_pdu_value)) return false;
-    memcpy(scoped_pdu_value + scoped_pdu_value_len, pdu, pdu_len);
-    scoped_pdu_value_len += pdu_len;
-
-    uint8_t scoped_pdu[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t scoped_pdu_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           scoped_pdu,
-           sizeof(scoped_pdu),
-           &scoped_pdu_len,
-           0x30U,
-           scoped_pdu_value,
-           scoped_pdu_value_len))
+    if(!seader_uhf_snmp_wrap_tlv_inplace(
+           scratch, scratch_capacity, scratch_len, 0x30U, &scratch_len) ||
+       !seader_uhf_snmp_wrap_tlv_inplace(
+           scratch, scratch_capacity, scratch_len, 0x04U, &scratch_len))
         return false;
 
-    uint8_t security_params_inner[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t security_params_inner_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           0x04U,
-           engine_id,
-           engine_id_len) ||
+    if(!seader_uhf_snmp_append_uint32(
+           global_data_value, sizeof(global_data_value), &global_data_value_len, 0U) ||
        !seader_uhf_snmp_append_uint32(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           engine_boots) ||
+           global_data_value, sizeof(global_data_value), &global_data_value_len, 756U) ||
+       !seader_uhf_snmp_append_tlv(
+           global_data_value,
+           sizeof(global_data_value),
+           &global_data_value_len,
+           0x04U,
+           flags,
+           sizeof(flags)) ||
        !seader_uhf_snmp_append_uint32(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           engine_time) ||
-       !seader_uhf_snmp_append_tlv(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           0x04U,
-           user_name,
-           user_name_len) ||
-       !seader_uhf_snmp_append_tlv(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           0x04U,
-           NULL,
-           0U) ||
-       !seader_uhf_snmp_append_tlv(
-           security_params_inner,
-           sizeof(security_params_inner),
-           &security_params_inner_len,
-           0x04U,
-           NULL,
-           0U)) {
+           global_data_value, sizeof(global_data_value), &global_data_value_len, 0x0101U)) {
         return false;
     }
-
-    uint8_t security_params_inner_sequence[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t security_params_inner_sequence_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           security_params_inner_sequence,
-           sizeof(security_params_inner_sequence),
-           &security_params_inner_sequence_len,
-           0x30U,
-           security_params_inner,
-           security_params_inner_len))
-        return false;
-
-    uint8_t security_params[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t security_params_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           security_params,
-           sizeof(security_params),
-           &security_params_len,
-           0x04U,
-           security_params_inner_sequence,
-           security_params_inner_sequence_len))
-        return false;
-
-    uint8_t global_data_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t global_data_value_len = 0U;
-    uint8_t flags[] = {0x04U};
-    if(!seader_uhf_snmp_append_uint32(global_data_value, sizeof(global_data_value), &global_data_value_len, 0U) ||
-       !seader_uhf_snmp_append_uint32(global_data_value, sizeof(global_data_value), &global_data_value_len, 756U) ||
-       !seader_uhf_snmp_append_tlv(
-           global_data_value, sizeof(global_data_value), &global_data_value_len, 0x04U, flags, sizeof(flags)) ||
-       !seader_uhf_snmp_append_uint32(global_data_value, sizeof(global_data_value), &global_data_value_len, 0x0101U)) {
-        return false;
-    }
-
-    uint8_t global_data[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t global_data_len = 0U;
     if(!seader_uhf_snmp_append_tlv(
            global_data,
            sizeof(global_data),
@@ -345,41 +275,42 @@ static bool seader_uhf_snmp_build_reportable_get_request(
            global_data_value,
            global_data_value_len))
         return false;
+    if(!seader_uhf_snmp_append_uint32(version, sizeof(version), &version_len, 3U)) return false;
 
-    uint8_t message_value[SEADER_SNMP_MAX_MSG_LEN] = {0};
-    size_t message_value_len = 0U;
-    if(!seader_uhf_snmp_append_uint32(
-           message_value, sizeof(message_value), &message_value_len, 3U))
+    if(version_len + global_data_len + scratch_len + scoped_pdu_len > message_capacity)
         return false;
-    if(message_value_len + global_data_len + security_params_len + scoped_pdu_len >
-       sizeof(message_value))
-        return false;
-    memcpy(message_value + message_value_len, global_data, global_data_len);
-    message_value_len += global_data_len;
-    memcpy(message_value + message_value_len, security_params, security_params_len);
-    message_value_len += security_params_len;
-    memcpy(message_value + message_value_len, scoped_pdu, scoped_pdu_len);
-    message_value_len += scoped_pdu_len;
+    memmove(message + version_len + global_data_len + scratch_len, message, scoped_pdu_len);
+    memcpy(message, version, version_len);
+    memcpy(message + version_len, global_data, global_data_len);
+    memcpy(message + version_len + global_data_len, scratch, scratch_len);
 
-    size_t encoded_message_len = 0U;
-    if(!seader_uhf_snmp_append_tlv(
-           message,
-           message_capacity,
-           &encoded_message_len,
-           0x30U,
-           message_value,
-           message_value_len))
-        return false;
-    *message_len = encoded_message_len;
-    return true;
+    *message_len = version_len + global_data_len + scratch_len + scoped_pdu_len;
+    return seader_uhf_snmp_wrap_tlv_inplace(
+        message, message_capacity, *message_len, 0x30U, message_len);
 }
 
 bool seader_uhf_snmp_build_discovery_request(
+    uint8_t* scratch,
+    size_t scratch_capacity,
     uint8_t* message,
     size_t message_capacity,
     size_t* message_len) {
     return seader_uhf_snmp_build_reportable_get_request(
-        NULL, 0U, NULL, 0U, 0U, 0U, NULL, 0U, NULL, 0U, message, message_capacity, message_len);
+        NULL,
+        0U,
+        NULL,
+        0U,
+        0U,
+        0U,
+        NULL,
+        0U,
+        NULL,
+        0U,
+        scratch,
+        scratch_capacity,
+        message,
+        message_capacity,
+        message_len);
 }
 
 bool seader_uhf_snmp_build_get_data_request(
@@ -391,21 +322,17 @@ bool seader_uhf_snmp_build_get_data_request(
     uint32_t engine_time,
     const uint8_t* target_oid,
     size_t target_oid_len,
+    uint8_t* scratch,
+    size_t scratch_capacity,
     uint8_t* message,
     size_t message_capacity,
     size_t* message_len) {
     static const uint8_t oid_get_data[] = {0x03U, 0x00U, 0x03U, 0x06U};
-    uint8_t get_data_payload[SEADER_SNMP_MAX_MSG_LEN] = {0};
     size_t get_data_payload_len = 0U;
 
+    if(!scratch || !message) return false;
     if(!seader_uhf_snmp_build_get_data_payload(
-           target_oid,
-           target_oid_len,
-           0U,
-           0x100U,
-           get_data_payload,
-           sizeof(get_data_payload),
-           &get_data_payload_len))
+           target_oid, target_oid_len, 0U, 0x100U, message, message_capacity, &get_data_payload_len))
         return false;
 
     return seader_uhf_snmp_build_reportable_get_request(
@@ -417,8 +344,10 @@ bool seader_uhf_snmp_build_get_data_request(
         engine_time,
         oid_get_data,
         sizeof(oid_get_data),
-        get_data_payload,
+        message,
         get_data_payload_len,
+        scratch,
+        scratch_capacity,
         message,
         message_capacity,
         message_len);
@@ -525,12 +454,10 @@ bool seader_uhf_snmp_parse_response(
     if(!seader_uhf_snmp_next_tlv(pdu_tlv.value, pdu_tlv.len, &pdu_offset, &req_id_tlv) ||
        req_id_tlv.tag != 0x02U)
         return false;
-    if(!seader_uhf_snmp_next_tlv(
-           pdu_tlv.value, pdu_tlv.len, &pdu_offset, &error_status_tlv) ||
+    if(!seader_uhf_snmp_next_tlv(pdu_tlv.value, pdu_tlv.len, &pdu_offset, &error_status_tlv) ||
        error_status_tlv.tag != 0x02U)
         return false;
-    if(!seader_uhf_snmp_next_tlv(
-           pdu_tlv.value, pdu_tlv.len, &pdu_offset, &error_index_tlv) ||
+    if(!seader_uhf_snmp_next_tlv(pdu_tlv.value, pdu_tlv.len, &pdu_offset, &error_index_tlv) ||
        error_index_tlv.tag != 0x02U)
         return false;
     if(!seader_uhf_snmp_next_tlv(pdu_tlv.value, pdu_tlv.len, &pdu_offset, &varbinds_tlv) ||
