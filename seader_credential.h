@@ -6,6 +6,7 @@
 #include <dialogs/dialogs.h>
 #include "protocol/picopass_protocol.h"
 #include "seader_credential_type.h"
+#include "seader_pacs_media_type.h"
 #include <optimized_ikeys.h>
 #include <optimized_cipher.h>
 
@@ -15,15 +16,6 @@
 #define SEADER_APP_MFC_FOLDER    EXT_PATH("nfc")
 
 typedef void (*SeaderLoadingCallback)(void* context, bool state);
-
-typedef enum {
-    SeaderPacsMediaTypeUnknown = 0,
-    SeaderPacsMediaTypeDesfire = 1,
-    SeaderPacsMediaTypeMifare = 2,
-    SeaderPacsMediaTypePicopass = 3,
-    SeaderPacsMediaTypeMifarePlus = 6,
-    SeaderPacsMediaTypeSeos = 7,
-} SeaderPacsMediaType;
 
 typedef enum {
     SeaderCredentialSaveFormatAgnostic,

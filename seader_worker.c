@@ -2,6 +2,7 @@
 #include "seader_hf_read_plan.h"
 #include "hf_read_lifecycle.h"
 #include "trace_log.h"
+#include "uhf_worker_start.h"
 
 #include <flipper_format/flipper_format.h>
 #include <lib/bit_lib/bit_lib.h>
@@ -28,6 +29,26 @@ static void seader_worker_release_hf_session(Seader* seader) {
     }
 
     seader_hf_plugin_release(seader);
+}
+
+static void seader_worker_release_uhf_session(Seader* seader) {
+    if(!seader) {
+        return;
+    }
+
+    if(seader->uhf_sam_session.active && !seader->uhf_sam_session.clear_sent &&
+       seader_sam_has_active_card(seader)) {
+        FURI_LOG_I(TAG, "Finalize UHF SAM cleanup before unload");
+        seader->uhf_sam_session.state = SeaderUhfSamSessionStateFailedCleanupPending;
+        seader->uhf_sam_session.clear_sent = true;
+        seader_send_no_card_detected(seader);
+        furi_delay_ms(30);
+    }
+    if(seader->sam_state != SeaderSamStateIdle) {
+        seader_sam_force_idle_for_recovery(seader);
+    }
+    memset(&seader->uhf_sam_session, 0, sizeof(seader->uhf_sam_session));
+    seader_uhf_plugin_release(seader);
 }
 
 static void seader_worker_fail_hf_startup(Seader* seader, const char* detail) {
@@ -516,6 +537,12 @@ int32_t seader_worker_task(void* context) {
         if(seader_worker->callback) {
             seader_worker->callback(SeaderWorkerEventHfTeardownComplete, seader_worker->context);
         }
+    } else if(seader_worker->state == SeaderWorkerStateUhfTeardown) {
+        SEADER_VERBOSE_I(TAG, "UHF teardown started");
+        seader_worker_release_uhf_session(seader);
+        if(seader_worker->callback) {
+            seader_worker->callback(SeaderWorkerEventUhfTeardownComplete, seader_worker->context);
+        }
     } else if(seader_worker->state == SeaderWorkerStateReading) {
         SEADER_VERBOSE_D(TAG, "Reading mode started");
         seader_worker_reading(seader);
@@ -529,7 +556,26 @@ void seader_worker_reading(Seader* seader) {
     SeaderWorker* seader_worker = seader->worker;
     SEADER_VERBOSE_I(TAG, "Reading loop started");
 
-    if(!seader_hf_plugin_acquire(seader) || !seader->plugin_hf || !seader->hf_plugin_ctx) {
+    const SeaderCredentialType selected_type = seader_hf_mode_get_selected_read_type(seader);
+    const bool is_uhf = selected_type == SeaderCredentialTypeUhf;
+
+    if(is_uhf) {
+        const bool acquire_ok = seader_uhf_plugin_acquire(seader);
+        if(!seader_uhf_worker_start_can_continue(
+               acquire_ok, seader->plugin_uhf != NULL, seader->uhf_plugin_ctx != NULL)) {
+            FURI_LOG_W(TAG, "UHF plugin acquire failed");
+            seader->uhf_read_failure_reason = PluginUhfReadFailureReasonModuleUnavailable;
+            strlcpy(seader->read_error, "UHF plugin load failed", sizeof(seader->read_error));
+            seader_worker_release_uhf_session(seader);
+            if(seader_worker->callback) {
+                seader_worker->callback(SeaderWorkerEventFail, seader_worker->context);
+            }
+            return;
+        }
+    }
+
+    if(!is_uhf &&
+       (!seader_hf_plugin_acquire(seader) || !seader->plugin_hf || !seader->hf_plugin_ctx)) {
         FURI_LOG_E(
             TAG,
             "HF plugin unavailable acquire=%d plugin=%p ctx=%p",
@@ -537,6 +583,53 @@ void seader_worker_reading(Seader* seader) {
             (void*)seader->plugin_hf,
             seader->hf_plugin_ctx);
         seader_worker_fail_hf_startup(seader, "HF unavailable");
+        return;
+    }
+
+    if(is_uhf) {
+        seader_worker->stage = SeaderPollerEventTypeCardDetect;
+        while(seader_worker->state == SeaderWorkerStateReading) {
+            PluginUhfStartReadResult start_result =
+                seader->plugin_uhf->start_read(seader->uhf_plugin_ctx);
+            if(start_result.outcome == PluginUhfStartReadOutcomeDetected) {
+                seader->uhf_session_state = SeaderUhfSessionStateActive;
+                while(seader_worker->stage != SeaderPollerEventTypeComplete &&
+                      seader_worker->stage != SeaderPollerEventTypeFail &&
+                      seader_worker->state == SeaderWorkerStateReading) {
+                    furi_delay_ms(10);
+                }
+
+                if(seader_worker->stage == SeaderPollerEventTypeComplete) {
+                    if(seader_worker->callback) {
+                        seader_worker->callback(SeaderWorkerEventSuccess, seader_worker->context);
+                    }
+                    break;
+                } else if(seader_worker->stage == SeaderPollerEventTypeFail) {
+                    if(seader_worker->callback) {
+                        seader_worker->callback(SeaderWorkerEventFail, seader_worker->context);
+                    }
+                    break;
+                }
+            }
+
+            if(start_result.outcome == PluginUhfStartReadOutcomeTerminalFail) {
+                seader->uhf_read_failure_reason = start_result.failure_reason;
+                strlcpy(
+                    seader->read_error,
+                    seader_uhf_read_failure_reason_text(start_result.failure_reason),
+                    sizeof(seader->read_error));
+                if(seader_worker->callback && seader_worker->state == SeaderWorkerStateReading) {
+                    seader_worker->callback(SeaderWorkerEventFail, seader_worker->context);
+                }
+                break;
+            }
+
+            if(seader_worker->state == SeaderWorkerStateReading) {
+                furi_delay_ms(50);
+            }
+        }
+
+        SEADER_VERBOSE_I(TAG, "Reading loop stopped");
         return;
     }
 

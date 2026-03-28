@@ -20,6 +20,7 @@ void seader_scene_read_prepare(Seader* seader) {
     if(seader->sam_state == SeaderSamStateIdle) {
         seader->samCommand = SamCommand_PR_NOTHING;
     }
+    seader->uhf_read_failure_reason = PluginUhfReadFailureReasonNone;
     memset(seader->read_error, 0, sizeof(seader->read_error));
 }
 
@@ -40,7 +41,11 @@ void seader_scene_read_abort_cleanup(Seader* seader) {
     furi_assert(seader);
     FURI_LOG_D("SceneRead", "Abort cleanup session sam=%d", seader->samCommand);
 
-    if(seader_sam_has_active_card(seader)) {
+    const bool uhf_context =
+        seader_hf_mode_get_selected_read_type(seader) == SeaderCredentialTypeUhf ||
+        seader->mode_runtime == SeaderModeRuntimeUHF || seader->uhf_sam_session.active;
+
+    if(!uhf_context && seader_sam_has_active_card(seader)) {
         seader_send_no_card_detected(seader);
     }
 

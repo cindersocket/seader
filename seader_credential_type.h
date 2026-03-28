@@ -5,6 +5,7 @@ typedef enum {
     SeaderCredentialTypePicopass,
     SeaderCredentialType14A,
     SeaderCredentialTypeMifareClassic,
+    SeaderCredentialTypeUhf,
     SeaderCredentialTypeVirtual,
     SeaderCredentialTypeConfig,
 } SeaderCredentialType;

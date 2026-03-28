@@ -17,6 +17,13 @@ typedef enum {
 } SeaderHfSessionState;
 
 typedef enum {
+    SeaderUhfSessionStateUnloaded,
+    SeaderUhfSessionStateLoaded,
+    SeaderUhfSessionStateActive,
+    SeaderUhfSessionStateTearingDown,
+} SeaderUhfSessionState;
+
+typedef enum {
     SeaderModeRuntimeNone,
     SeaderModeRuntimeHF,
     SeaderModeRuntimeUHF,
@@ -32,6 +39,16 @@ typedef enum {
     SeaderHfTeardownActionStopApp,
 } SeaderHfTeardownAction;
 
+typedef enum {
+    SeaderUhfTeardownActionNone,
+    SeaderUhfTeardownActionSamPresent,
+    SeaderUhfTeardownActionBoardMissing,
+    SeaderUhfTeardownActionAutoRecover,
+    SeaderUhfTeardownActionPrepareSave,
+    SeaderUhfTeardownActionRestartRead,
+    SeaderUhfTeardownActionStopApp,
+} SeaderUhfTeardownAction;
+
 bool seader_worker_acquire(Seader* seader);
 void seader_worker_release(Seader* seader);
 bool seader_temp_strings_ensure(Seader* seader, size_t count);
@@ -42,5 +59,9 @@ bool seader_wiegand_plugin_acquire(Seader* seader);
 void seader_wiegand_plugin_release(Seader* seader);
 bool seader_hf_plugin_acquire(Seader* seader);
 void seader_hf_plugin_release(Seader* seader);
+bool seader_uhf_plugin_acquire(Seader* seader);
+void seader_uhf_plugin_release(Seader* seader);
 bool seader_hf_request_teardown(Seader* seader, SeaderHfTeardownAction action);
 bool seader_hf_finish_teardown_action(Seader* seader);
+bool seader_uhf_request_teardown(Seader* seader, SeaderUhfTeardownAction action);
+bool seader_uhf_finish_teardown_action(Seader* seader);

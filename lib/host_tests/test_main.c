@@ -5,14 +5,22 @@ extern MunitSuite test_board_power_lifecycle_suite;
 extern MunitSuite test_hf_read_lifecycle_suite;
 extern MunitSuite test_sam_startup_ui_suite;
 extern MunitSuite test_ccid_logic_suite;
+extern MunitSuite test_sam_tx_layout_suite;
 extern MunitSuite test_sam_key_label_suite;
 extern MunitSuite test_t1_existing_suite;
 extern MunitSuite test_t1_protocol_suite;
 extern MunitSuite test_snmp_suite;
 extern MunitSuite test_uhf_status_label_suite;
+extern MunitSuite test_uhf_read_lifecycle_suite;
 extern MunitSuite test_credential_sio_label_suite;
 extern MunitSuite test_hf_read_plan_suite;
 extern MunitSuite test_runtime_policy_suite;
+extern MunitSuite test_uhf_frame_suite;
+extern MunitSuite test_uhf_logic_suite;
+extern MunitSuite test_uhf_routed_suite;
+extern MunitSuite test_fake_uhf_trace_suite;
+extern MunitSuite test_uhf_session_lifecycle_suite;
+extern MunitSuite test_uhf_worker_start_suite;
 extern MunitSuite test_wiegand_plugin_suite;
 
 int main(int argc, char* argv[]) {
@@ -37,11 +45,31 @@ int main(int argc, char* argv[]) {
         {"/t1", test_t1_existing_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/t1", test_t1_protocol_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/ccid", test_ccid_logic_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/sam-tx-layout", test_sam_tx_layout_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/snmp", test_snmp_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/uhf-status-label", test_uhf_status_label_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-read-lifecycle",
+         test_uhf_read_lifecycle_suite.tests,
+         NULL,
+         1,
+         MUNIT_SUITE_OPTION_NONE},
         {"/credential-sio-label", test_credential_sio_label_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/hf-read-plan", test_hf_read_plan_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/runtime-policy", test_runtime_policy_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-frame", test_uhf_frame_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf", test_uhf_logic_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-routed", test_uhf_routed_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/fake-uhf-trace", test_fake_uhf_trace_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-session-lifecycle",
+         test_uhf_session_lifecycle_suite.tests,
+         NULL,
+         1,
+         MUNIT_SUITE_OPTION_NONE},
+        {"/uhf-worker-start",
+         test_uhf_worker_start_suite.tests,
+         NULL,
+         1,
+         MUNIT_SUITE_OPTION_NONE},
         {"/wiegand-plugin", test_wiegand_plugin_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {NULL, NULL, NULL, 0, 0},
     };

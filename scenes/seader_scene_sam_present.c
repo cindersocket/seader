@@ -1,6 +1,7 @@
 #include "../seader_i.h"
 enum SubmenuIndex {
     SubmenuIndexRead,
+    SubmenuIndexReadUhf,
     SubmenuIndexSaved,
     SubmenuIndexAPDURunner,
     SubmenuIndexReadConfigCard,
@@ -17,6 +18,14 @@ static void seader_scene_sam_present_rebuild_menu(Seader* seader, uint32_t selec
 
     submenu_add_item(
         submenu, "Read HF", SubmenuIndexRead, seader_scene_sam_present_submenu_callback, seader);
+    if(seader->snmp_probe.monza4qt_key_present) {
+        submenu_add_item(
+            submenu,
+            "Read UHF",
+            SubmenuIndexReadUhf,
+            seader_scene_sam_present_submenu_callback,
+            seader);
+    }
     submenu_add_item(
         submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_present_submenu_callback, seader);
 
@@ -73,12 +82,21 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
 
     if(event.type == SceneManagerEventTypeCustom) {
         if(seader->sam_present_menu_guard_active &&
-           (event.event == SubmenuIndexRead || event.event == SubmenuIndexSaved ||
-            event.event == SubmenuIndexAPDURunner || event.event == SubmenuIndexReadConfigCard ||
-            event.event == SubmenuIndexSamInfo)) {
+           (event.event == SubmenuIndexRead || event.event == SubmenuIndexReadUhf ||
+            event.event == SubmenuIndexSaved || event.event == SubmenuIndexAPDURunner ||
+            event.event == SubmenuIndexReadConfigCard || event.event == SubmenuIndexSamInfo)) {
             seader->sam_present_menu_guard_active = false;
             consumed = true;
         } else if(event.event == SubmenuIndexRead) {
+            seader_hf_mode_activate(seader);
+            seader_hf_mode_set_selected_read_type(seader, SeaderCredentialTypeNone);
+            scene_manager_set_scene_state(
+                seader->scene_manager, SeaderSceneSamPresent, event.event);
+            scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+            consumed = true;
+        } else if(event.event == SubmenuIndexReadUhf) {
+            seader_hf_mode_activate(seader);
+            seader_hf_mode_set_selected_read_type(seader, SeaderCredentialTypeUhf);
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneSamPresent, event.event);
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
@@ -109,13 +127,21 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
             consumed = true;
         } else if(event.event == SeaderWorkerEventHfTeardownComplete) {
             consumed = seader_hf_finish_teardown_action(seader);
+        } else if(event.event == SeaderWorkerEventUhfTeardownComplete) {
+            consumed = seader_uhf_finish_teardown_action(seader);
         } else if(event.event == SeaderCustomEventSamStatusUpdated) {
             seader_scene_sam_present_rebuild_menu(
                 seader, submenu_get_selected_item(seader->submenu));
             consumed = true;
         }
     } else if(event.type == SceneManagerEventTypeBack) {
-        consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionStopApp);
+        if(seader->sam_present_menu_guard_active) {
+            seader->sam_present_menu_guard_active = false;
+            consumed = true;
+        } else {
+            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionStopApp) ||
+                       seader_uhf_request_teardown(seader, SeaderUhfTeardownActionStopApp);
+        }
     } else if(event.type == SceneManagerEventTypeTick) {
         if(seader->sam_present_menu_guard_active) {
             seader->sam_present_menu_guard_active = false;

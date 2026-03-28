@@ -43,6 +43,7 @@
 
 #include "wiegand_interface_fal/interface.h"
 #include "hf_interface_fal/hf_interface.h"
+#include "uhf_interface_fal/uhf_interface.h"
 #include <flipper_application/flipper_application.h>
 #include <flipper_application/plugins/plugin_manager.h>
 #include <loader/firmware_api/firmware_api.h>
@@ -64,6 +65,8 @@
 #include "board_power_lifecycle.h"
 #include "sam_startup_ui.h"
 #include "sam_key_label.h"
+#include "uhf_read_lifecycle.h"
+#include "uhf_logic.h"
 #include "uhf_snmp_probe.h"
 #include "uhf_status_label.h"
 
@@ -138,6 +141,56 @@ typedef enum {
     SeaderSamIntentMaintenance,
 } SeaderSamIntent;
 
+typedef enum {
+    SeaderUhfSamSessionStateIdle = 0,
+    SeaderUhfSamSessionStateSentCardDetected,
+    SeaderUhfSamSessionStateSentGetContentElement2,
+    SeaderUhfSamSessionStateWaitingBridge,
+    SeaderUhfSamSessionStateAwaitFinalSamResponse,
+    SeaderUhfSamSessionStateSentClearDetectedCardNone,
+    SeaderUhfSamSessionStateFailedDraining,
+    SeaderUhfSamSessionStateFailedCleanupPending,
+    SeaderUhfSamSessionStateDone,
+    SeaderUhfSamSessionStateFailed,
+} SeaderUhfSamSessionState;
+
+typedef enum {
+    SeaderUhfBridgeCommandNone = 0,
+    SeaderUhfBridgeCommandGetVersion,
+    SeaderUhfBridgeCommandGetProperties,
+    SeaderUhfBridgeCommandSetAccessPassword,
+    SeaderUhfBridgeCommandGetPrivateData,
+} SeaderUhfBridgeCommand;
+
+typedef enum {
+    SeaderUhfBridgeFailureSiteNone = 0,
+    SeaderUhfBridgeFailureSiteParse,
+    SeaderUhfBridgeFailureSiteDispatch,
+    SeaderUhfBridgeFailureSiteResponseSend,
+    SeaderUhfBridgeFailureSitePrivateRead,
+    SeaderUhfBridgeFailureSiteUnexpectedResponse,
+} SeaderUhfBridgeFailureSite;
+
+typedef struct {
+    bool active;
+    bool clear_sent;
+    uint16_t session_id;
+    SeaderUhfSamSessionState state;
+    uint16_t error_code;
+    uint16_t error_detail;
+    uint8_t derive_csn[SEADER_UHF_NORMALIZED_CSN_LEN];
+    uint8_t derive_csn_len;
+    uint8_t trace_tid[12];
+    uint8_t trace_tid_len;
+    uint8_t key[4];
+    uint8_t key_len;
+    uint8_t last_routed_tag;
+    SeaderUhfBridgeCommand last_bridge_command;
+    SeaderUhfBridgeCommand failed_bridge_command;
+    SeaderUhfBridgeFailureSite bridge_failure_site;
+    bool nfc_off_seen;
+} SeaderUhfSamSession;
+
 struct Seader {
     bool board_power_enabled;
     bool board_power_owned;
@@ -205,11 +258,18 @@ struct Seader {
     PluginManager* hf_plugin_manager;
     PluginHf* plugin_hf;
     void* hf_plugin_ctx;
+    PluginManager* uhf_plugin_manager;
+    PluginUhf* plugin_uhf;
+    void* uhf_plugin_ctx;
     SeaderModeRuntime mode_runtime;
     SeaderHfSessionState hf_session_state;
+    SeaderUhfSessionState uhf_session_state;
     SeaderHfTeardownAction hf_teardown_action;
+    SeaderUhfTeardownAction uhf_teardown_action;
     SeaderHfReadState hf_read_state;
     SeaderHfReadFailureReason hf_read_failure_reason;
+    PluginUhfReadFailureReason uhf_read_failure_reason;
+    SeaderUhfSamSession uhf_sam_session;
     uint32_t hf_read_last_progress_tick;
     bool loading_popup_enabled;
     bool start_scene_active;

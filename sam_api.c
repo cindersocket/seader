@@ -3,9 +3,15 @@
 #include "protocol/rfal_picopass.h"
 #include "sam_key_label.h"
 #include "trace_log.h"
+#include "uhf_logic.h"
+#include "uhf_routed.h"
 #include "uhf_snmp_probe.h"
 #include "card_details_builder.h"
+#include "uhf_interface_fal/uhf_interface.h"
 #include "uhf_status_label.h"
+#include <I2CClockSpeed.h>
+#include <I2CCommand.h>
+#include <UHFModuleResponse.h>
 #include <toolbox/path.h>
 #include <toolbox/version.h>
 #include <bit_lib/bit_lib.h>
@@ -28,6 +34,142 @@ static void seader_sam_set_state(
     SeaderSamState state,
     SeaderSamIntent intent,
     SamCommand_PR command);
+static void seader_send_payload(
+    Seader* seader,
+    Payload_t* payload,
+    uint8_t from,
+    uint8_t to,
+    uint8_t replyTo);
+static void seader_send_card_detected(Seader* seader, CardDetails_t* cardDetails);
+static bool seader_uhf_request_from_i2c_command(
+    const I2CCommand_t* i2c_command,
+    PluginUhfRequest* request_out);
+static bool seader_send_uhf_i2c_response(
+    Seader* seader,
+    const I2CCommand_t* request,
+    const PluginUhfResponse* response);
+static bool seader_send_uhf_routed_response(
+    Seader* seader,
+    const uint8_t i2c_header[6],
+    const PluginUhfResponse* response);
+static void
+    seader_uhf_session_begin(Seader* seader, const uint8_t* derive_csn, size_t derive_csn_len);
+static void seader_uhf_session_fail(
+    Seader* seader,
+    PluginUhfReadFailureReason reason,
+    uint16_t error_code,
+    uint16_t error_detail);
+static bool seader_uhf_session_complete_key(Seader* seader, const uint8_t* key, size_t key_len);
+static bool seader_send_uhf_get_content_element2(Seader* seader);
+
+static bool seader_uhf_request_from_i2c_command(
+    const I2CCommand_t* i2c_command,
+    PluginUhfRequest* request_out) {
+    if(!i2c_command || !request_out || !i2c_command->header.buf ||
+       i2c_command->header.size != 6U) {
+        return false;
+    }
+
+    memset(request_out, 0, sizeof(*request_out));
+    request_out->bus_address = (uint32_t)i2c_command->busAddress;
+
+    switch(i2c_command->uhfModuleCommand.present) {
+    case UHFModuleCommand_PR_uhfModuleCommandGetVersion:
+        request_out->command = PluginUhfCommandGetVersion;
+        return true;
+    case UHFModuleCommand_PR_uhfModuleCommandGetProperties:
+        request_out->command = PluginUhfCommandGetProperties;
+        return true;
+    case UHFModuleCommand_PR_uhfModuleCommandSetAccessPassword:
+        request_out->command = PluginUhfCommandSetAccessPassword;
+        request_out->command_value_len =
+            i2c_command->uhfModuleCommand.choice.uhfModuleCommandSetAccessPassword.size;
+        if(request_out->command_value_len > sizeof(request_out->command_value)) {
+            return false;
+        }
+        memcpy(
+            request_out->command_value,
+            i2c_command->uhfModuleCommand.choice.uhfModuleCommandSetAccessPassword.buf,
+            request_out->command_value_len);
+        return true;
+    case UHFModuleCommand_PR_uhfModuleCommandGetPrivateData:
+        request_out->command = PluginUhfCommandGetPrivateData;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool seader_send_uhf_i2c_response(
+    Seader* seader,
+    const I2CCommand_t* request,
+    const PluginUhfResponse* response) {
+    if(!seader || !request || !response || !request->header.buf || request->header.size != 6U) {
+        return false;
+    }
+
+    Response_t wrapped = {0};
+    wrapped.present = Response_PR_uhfModuleResponse;
+
+    UHFModuleResponse_t* uhf_response = &wrapped.choice.uhfModuleResponse;
+    memset(uhf_response, 0, sizeof(*uhf_response));
+
+    switch(response->type) {
+    case PluginUhfResponseVersion:
+        uhf_response->present = UHFModuleResponse_PR_uhfModuleResponseVersion;
+        OCTET_STRING_fromBuf(
+            &uhf_response->choice.uhfModuleResponseVersion,
+            (const char*)response->version,
+            response->version_len);
+        break;
+    case PluginUhfResponseGetProperties:
+        uhf_response->present = UHFModuleResponse_PR_uhfModuleResponseGetProperties;
+        uhf_response->choice.uhfModuleResponseGetProperties.i2cMaxClockSpeedInKHz =
+            calloc(1, sizeof(I2CClockSpeed_t));
+        if(!uhf_response->choice.uhfModuleResponseGetProperties.i2cMaxClockSpeedInKHz) {
+            return false;
+        }
+        *uhf_response->choice.uhfModuleResponseGetProperties.i2cMaxClockSpeedInKHz =
+            I2CClockSpeed_i2c100KHz;
+        break;
+    case PluginUhfResponseSetAccessPassword:
+        uhf_response->present = UHFModuleResponse_PR_uhfModuleResponseSetAccessPassword;
+        break;
+    case PluginUhfResponseGetPrivateData:
+        uhf_response->present = UHFModuleResponse_PR_uhfModuleResponseGetPrivateData;
+        OCTET_STRING_fromBuf(
+            &uhf_response->choice.uhfModuleResponseGetPrivateData.tid,
+            (const char*)response->tid,
+            response->tid_len);
+        OCTET_STRING_fromBuf(
+            &uhf_response->choice.uhfModuleResponseGetPrivateData.userData,
+            (const char*)response->user_data,
+            response->user_data_len);
+        break;
+    case PluginUhfResponseNone:
+    default:
+        return false;
+    }
+
+    const uint8_t* header = request->header.buf;
+    seader_send_response(seader, &wrapped, header[1], header[0], 0x00U);
+    ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_UHFModuleResponse, uhf_response);
+    return true;
+}
+
+static bool seader_send_uhf_routed_response(
+    Seader* seader,
+    const uint8_t i2c_header[6],
+    const PluginUhfResponse* response) {
+    if(!i2c_header) {
+        return false;
+    }
+
+    I2CCommand_t request = {0};
+    request.header.buf = (uint8_t*)i2c_header;
+    request.header.size = 6U;
+    return seader_send_uhf_i2c_response(seader, &request, response);
+}
 
 static const char* seader_snmp_probe_stage_name(SeaderUhfSnmpProbeStage stage) {
     switch(stage) {
@@ -342,11 +484,16 @@ bool seader_sam_can_accept_card(const Seader* seader) {
 bool seader_sam_has_active_card(const Seader* seader) {
     return seader->sam_state == SeaderSamStateDetectPending ||
            seader->sam_state == SeaderSamStateConversation ||
-           seader->sam_state == SeaderSamStateFinishing;
+           seader->sam_state == SeaderSamStateFinishing ||
+           seader->sam_state == SeaderSamStateClearPending;
 }
 
 void seader_sam_force_idle_for_recovery(Seader* seader) {
     if(!seader) {
+        return;
+    }
+
+    if(seader->sam_state == SeaderSamStateIdle && !seader->uhf_sam_session.active) {
         return;
     }
 
@@ -355,6 +502,210 @@ void seader_sam_force_idle_for_recovery(Seader* seader) {
     if(seader->worker) {
         seader_worker_reset_poller_session(seader->worker);
     }
+}
+
+static void
+    seader_uhf_session_begin(Seader* seader, const uint8_t* derive_csn, size_t derive_csn_len) {
+    if(!seader) {
+        return;
+    }
+
+    SeaderUhfSamSession* session = &seader->uhf_sam_session;
+    session->session_id++;
+    if(session->session_id == 0U) {
+        session->session_id = 1U;
+    }
+    session->active = true;
+    session->clear_sent = false;
+    session->state = SeaderUhfSamSessionStateSentCardDetected;
+    session->error_code = 0U;
+    session->error_detail = 0U;
+    session->key_len = 0U;
+    session->trace_tid_len = 0U;
+    session->last_routed_tag = 0U;
+    session->last_bridge_command = SeaderUhfBridgeCommandNone;
+    session->failed_bridge_command = SeaderUhfBridgeCommandNone;
+    session->bridge_failure_site = SeaderUhfBridgeFailureSiteNone;
+    session->nfc_off_seen = false;
+    memset(session->key, 0, sizeof(session->key));
+    memset(session->trace_tid, 0, sizeof(session->trace_tid));
+    memset(session->derive_csn, 0, sizeof(session->derive_csn));
+    if(derive_csn && derive_csn_len > 0U) {
+        if(derive_csn_len > sizeof(session->derive_csn)) {
+            derive_csn_len = sizeof(session->derive_csn);
+        }
+        memcpy(session->derive_csn, derive_csn, derive_csn_len);
+        session->derive_csn_len = (uint8_t)derive_csn_len;
+    } else {
+        session->derive_csn_len = 0U;
+    }
+}
+
+static const char* seader_uhf_bridge_command_text(SeaderUhfBridgeCommand command) {
+    switch(command) {
+    case SeaderUhfBridgeCommandGetVersion:
+        return "getVersion";
+    case SeaderUhfBridgeCommandGetProperties:
+        return "getProperties";
+    case SeaderUhfBridgeCommandSetAccessPassword:
+        return "setAccessPassword";
+    case SeaderUhfBridgeCommandGetPrivateData:
+        return "getPrivateData";
+    case SeaderUhfBridgeCommandNone:
+    default:
+        return "unknown";
+    }
+}
+
+static const char* seader_uhf_bridge_failure_text(
+    SeaderUhfBridgeCommand command,
+    SeaderUhfBridgeFailureSite site) {
+    switch(site) {
+    case SeaderUhfBridgeFailureSiteParse:
+        return "UHF bridge parse failed";
+    case SeaderUhfBridgeFailureSiteDispatch:
+        switch(command) {
+        case SeaderUhfBridgeCommandGetProperties:
+            return "UHF getProperties failed";
+        case SeaderUhfBridgeCommandSetAccessPassword:
+            return "UHF access-password setup failed";
+        case SeaderUhfBridgeCommandGetPrivateData:
+            return "UHF private data read failed";
+        case SeaderUhfBridgeCommandGetVersion:
+            return "UHF getVersion failed";
+        case SeaderUhfBridgeCommandNone:
+        default:
+            return "UHF bridge dispatch failed";
+        }
+    case SeaderUhfBridgeFailureSiteResponseSend:
+        return "UHF bridge response failed";
+    case SeaderUhfBridgeFailureSitePrivateRead:
+        return "UHF private data read failed";
+    case SeaderUhfBridgeFailureSiteUnexpectedResponse:
+        return "UHF bridge response unexpected";
+    case SeaderUhfBridgeFailureSiteNone:
+    default:
+        return seader_uhf_read_failure_reason_text(PluginUhfReadFailureReasonInternalState);
+    }
+}
+
+static bool seader_uhf_session_is_failed_cleanup_state(const SeaderUhfSamSession* session) {
+    return session && session->active &&
+           (session->state == SeaderUhfSamSessionStateFailedDraining ||
+            session->state == SeaderUhfSamSessionStateFailedCleanupPending ||
+            session->state == SeaderUhfSamSessionStateFailed);
+}
+
+static void seader_uhf_session_fail(
+    Seader* seader,
+    PluginUhfReadFailureReason reason,
+    uint16_t error_code,
+    uint16_t error_detail) {
+    if(!seader) {
+        return;
+    }
+
+    SeaderUhfSamSession* session = &seader->uhf_sam_session;
+    if(session->active) {
+        session->state = SeaderUhfSamSessionStateFailedDraining;
+        session->error_code = error_code;
+        session->error_detail = error_detail;
+    }
+
+    seader->uhf_read_failure_reason = reason == PluginUhfReadFailureReasonNone ?
+                                          PluginUhfReadFailureReasonInternalState :
+                                          reason;
+    strlcpy(
+        seader->read_error,
+        seader_uhf_read_failure_reason_text(seader->uhf_read_failure_reason),
+        sizeof(seader->read_error));
+
+    if(seader->worker) {
+        seader->worker->stage = SeaderPollerEventTypeFail;
+    }
+    FURI_LOG_W(
+        TAG,
+        "UHF session fail reason=%d code=0x%04x detail=0x%04x state=%d",
+        seader->uhf_read_failure_reason,
+        error_code,
+        error_detail,
+        session->state);
+
+    if(seader->sam_state != SeaderSamStateIdle) {
+        seader_sam_force_idle_for_recovery(seader);
+        if(seader->worker) {
+            seader->worker->stage = SeaderPollerEventTypeFail;
+        }
+    }
+}
+
+static void seader_uhf_session_fail_bridge(
+    Seader* seader,
+    SeaderUhfBridgeCommand command,
+    SeaderUhfBridgeFailureSite site,
+    uint16_t error_code,
+    uint16_t error_detail) {
+    if(!seader) {
+        return;
+    }
+
+    SeaderUhfSamSession* session = &seader->uhf_sam_session;
+    session->failed_bridge_command = command;
+    session->bridge_failure_site = site;
+    seader_uhf_session_fail(
+        seader, PluginUhfReadFailureReasonInternalState, error_code, error_detail);
+    strlcpy(
+        seader->read_error,
+        seader_uhf_bridge_failure_text(command, site),
+        sizeof(seader->read_error));
+}
+
+static bool seader_uhf_session_complete_key(Seader* seader, const uint8_t* key, size_t key_len) {
+    if(!seader || !key || key_len == 0U) {
+        return false;
+    }
+
+    SeaderUhfSamSession* session = &seader->uhf_sam_session;
+    if(!session->active) {
+        return false;
+    }
+
+    if(key_len > sizeof(session->key)) {
+        key_len = sizeof(session->key);
+    }
+    memcpy(session->key, key, key_len);
+    session->key_len = (uint8_t)key_len;
+    session->state = SeaderUhfSamSessionStateWaitingBridge;
+    return true;
+}
+
+static bool seader_send_uhf_get_content_element2(Seader* seader) {
+    if(!seader) {
+        return false;
+    }
+
+    RequestPacs_t request_pacs = {0};
+    OCTET_STRING_t oid = {
+        .buf = (uint8_t*)seader_oid,
+        .size = sizeof(seader_oid),
+    };
+
+    request_pacs.contentElementTag = ContentElementTag_implicitFormatPhysicalAccessBits;
+    request_pacs.oid = &oid;
+
+    SamCommand_t sam_command = {0};
+    sam_command.present = SamCommand_PR_requestPacs2;
+    sam_command.choice.requestPacs2 = request_pacs;
+
+    Payload_t payload = {0};
+    payload.present = Payload_PR_samCommand;
+    payload.choice.samCommand = sam_command;
+
+    seader_sam_set_state(
+        seader, SeaderSamStateConversation, SeaderSamIntentReadPacs2, sam_command.present);
+    seader_send_payload(
+        seader, &payload, ExternalApplicationA, SAMInterface, ExternalApplicationA);
+    return true;
 }
 
 PicopassError seader_worker_fake_epurse_update(BitBuffer* tx_buffer, BitBuffer* rx_buffer) {
@@ -743,7 +1094,38 @@ bool seader_worker_send_process_snmp_message(
     return true;
 }
 
-void seader_send_card_detected(Seader* seader, CardDetails_t* cardDetails) {
+bool seader_send_uhf_card_detected(Seader* seader, const uint8_t* sam_csn, size_t sam_csn_len) {
+    furi_check(seader);
+    furi_check(sam_csn);
+
+    if(sam_csn_len != SEADER_UHF_NORMALIZED_CSN_LEN) {
+        return false;
+    }
+
+    CardDetails_t cardDetails = {0};
+    const uint8_t protocol_bytes[] = {0x00, 0x14};
+
+    OCTET_STRING_fromBuf(
+        &cardDetails.protocol, (const char*)protocol_bytes, sizeof(protocol_bytes));
+    OCTET_STRING_fromBuf(&cardDetails.csn, (const char*)sam_csn, sam_csn_len);
+
+    if(!seader->uhf_sam_session.active && seader->credential &&
+       seader->credential->type == SeaderCredentialTypeUhf) {
+        seader_uhf_session_begin(seader, sam_csn, sam_csn_len);
+    }
+
+    seader_sam_set_state(
+        seader,
+        SeaderSamStateDetectPending,
+        seader->sam_intent == SeaderSamIntentConfig ? SeaderSamIntentConfig :
+                                                      SeaderSamIntentReadPacs2,
+        SamCommand_PR_cardDetected);
+    seader_send_card_detected(seader, &cardDetails);
+    seader_card_details_reset(&cardDetails);
+    return true;
+}
+
+static void seader_send_card_detected(Seader* seader, CardDetails_t* cardDetails) {
     furi_check(seader);
     furi_check(cardDetails);
     furi_check(cardDetails->csn.buf);
@@ -1029,6 +1411,49 @@ bool seader_parse_sam_response2(Seader* seader, SamResponse2_t* samResponse) {
     switch(samResponse->present) {
     case SamResponse2_PR_pacs:
         SEADER_VERBOSE_I(TAG, "samResponse2 SamResponse2_PR_pacs");
+        if(seader->uhf_sam_session.active) {
+            if(seader_uhf_session_is_failed_cleanup_state(&seader->uhf_sam_session)) {
+                FURI_LOG_W(
+                    TAG,
+                    "Ignore stale UHF pacs2 after failure state=%d",
+                    seader->uhf_sam_session.state);
+                break;
+            }
+
+            if(seader->uhf_sam_session.state != SeaderUhfSamSessionStateAwaitFinalSamResponse) {
+                FURI_LOG_W(
+                    TAG,
+                    "Ignore stale UHF pacs2 before final response state=%d",
+                    seader->uhf_sam_session.state);
+                break;
+            }
+
+            Pacs2_t pacs2 = samResponse->choice.pacs;
+            OCTET_STRING_t* pacs = pacs2.bits;
+
+            seader->credential->has_pacs_media_type = pacs2.type != NULL;
+            seader->credential->pacs_media_type = pacs2.type ? (SeaderPacsMediaType)(*pacs2.type) :
+                                                               SeaderPacsMediaTypeUhf;
+
+            if(!seader_unpack_pacs2_bits(seader, pacs)) {
+                seader_uhf_session_fail_bridge(
+                    seader,
+                    seader->uhf_sam_session.last_bridge_command,
+                    SeaderUhfBridgeFailureSiteUnexpectedResponse,
+                    0x0503U,
+                    0U);
+                break;
+            }
+
+            seader->uhf_sam_session.state = SeaderUhfSamSessionStateDone;
+            if(seader->worker) {
+                seader->worker->stage = SeaderPollerEventTypeComplete;
+            }
+            seader_sam_set_state(
+                seader, SeaderSamStateIdle, SeaderSamIntentNone, SamCommand_PR_NOTHING);
+            break;
+        }
+
         if((seader->sam_state != SeaderSamStateConversation &&
             seader->sam_state != SeaderSamStateFinishing) ||
            seader->sam_intent != SeaderSamIntentReadPacs2) {
@@ -1075,10 +1500,24 @@ bool seader_parse_sam_response2(Seader* seader, SamResponse2_t* samResponse) {
 bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
     SeaderWorker* seader_worker = seader_get_active_worker(seader);
 
+    if(seader_uhf_session_is_failed_cleanup_state(&seader->uhf_sam_session) &&
+       seader->sam_state != SeaderSamStateClearPending) {
+        FURI_LOG_W(
+            TAG,
+            "Ignore stale samResponse during failed UHF cleanup state=%d",
+            seader->uhf_sam_session.state);
+        return false;
+    }
+
     switch(seader->sam_state) {
     case SeaderSamStateConversation:
     case SeaderSamStateFinishing:
-        if(seader->sam_intent == SeaderSamIntentConfig) {
+        if(seader->uhf_sam_session.active && seader->samCommand == SamCommand_PR_requestPacs2) {
+            if(seader->uhf_sam_session.key_len == 0U) {
+                seader_uhf_session_fail(
+                    seader, PluginUhfReadFailureReasonInternalState, 0x0505U, 0U);
+            }
+        } else if(seader->sam_intent == SeaderSamIntentConfig) {
             FURI_LOG_I(TAG, "samResponse config");
             if(seader_worker) {
                 seader_worker->stage = SeaderPollerEventTypeFail;
@@ -1141,7 +1580,13 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
         break;
     case SeaderSamStateDetectPending:
         SEADER_VERBOSE_I(TAG, "samResponse cardDetected");
-        if(seader->sam_intent == SeaderSamIntentConfig) {
+        if(seader->uhf_sam_session.active) {
+            seader->uhf_sam_session.state = SeaderUhfSamSessionStateSentGetContentElement2;
+            if(!seader_send_uhf_get_content_element2(seader)) {
+                seader_uhf_session_fail(
+                    seader, PluginUhfReadFailureReasonSamCardDetectFailed, 0x0001U, 0U);
+            }
+        } else if(seader->sam_intent == SeaderSamIntentConfig) {
             seader_send_process_config_card(seader);
         } else if(seader->sam_intent == SeaderSamIntentReadPacs2) {
             seader_send_request_pacs2(seader);
@@ -1156,6 +1601,9 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
             TAG,
             "cardDetected ack clear stage=%d",
             seader_worker ? (int)seader_worker->stage : -1);
+        if(seader->uhf_sam_session.active) {
+            seader->uhf_sam_session.state = SeaderUhfSamSessionStateDone;
+        }
         seader_sam_set_state(
             seader, SeaderSamStateIdle, SeaderSamIntentNone, SamCommand_PR_NOTHING);
         break;
@@ -1703,6 +2151,27 @@ bool seader_worker_state_machine(
                 seader->sam_intent);
         }
         break;
+    case Payload_PR_i2cCommand:
+        if(!online && seader->plugin_uhf && seader->uhf_plugin_ctx &&
+           seader->credential->type == SeaderCredentialTypeUhf) {
+            PluginUhfRequest request = {0};
+            PluginUhfResponse response = {0};
+            if(!seader_uhf_request_from_i2c_command(&payload->choice.i2cCommand, &request)) {
+                seader_abort_active_read(seader);
+                break;
+            }
+
+            processed = seader->plugin_uhf->handle_i2c_command(
+                seader->uhf_plugin_ctx, &request, &response);
+            if(processed) {
+                processed =
+                    seader_send_uhf_i2c_response(seader, &payload->choice.i2cCommand, &response);
+            }
+            if(!processed) {
+                seader_abort_active_read(seader);
+            }
+        }
+        break;
     case Payload_PR_errorResponse:
         processed = true;
         if(seader->sam_state == SeaderSamStateCapabilityPending) {
@@ -1759,8 +2228,13 @@ bool seader_worker_state_machine(
             }
         } else {
             FURI_LOG_W(TAG, "Payload_PR_errorResponse");
-            view_dispatcher_send_custom_event(
-                seader->view_dispatcher, SeaderCustomEventWorkerExit);
+            if(seader->uhf_sam_session.active) {
+                seader_uhf_session_fail(
+                    seader, PluginUhfReadFailureReasonInternalState, 0x0502U, 0U);
+            } else {
+                view_dispatcher_send_custom_event(
+                    seader->view_dispatcher, SeaderCustomEventWorkerExit);
+            }
         }
         break;
     default:
@@ -1783,6 +2257,147 @@ bool seader_process_success_response_i(
 
     /* Seader wraps each ASN.1 payload with a 6-byte application header
        {from, to, replyTo, 0x00, 0x00, 0x00}. Skip that prefix before decoding. */
+    if(len < 6U) {
+        seader_abort_active_read(seader);
+        return false;
+    }
+
+    if(seader->uhf_sam_session.active && len > 6U) {
+        const uint8_t first_tag = apdu[6];
+        seader->uhf_sam_session.last_routed_tag = first_tag;
+
+        if(seader_uhf_session_is_failed_cleanup_state(&seader->uhf_sam_session) &&
+           first_tag != 0xA1U) {
+            FURI_LOG_W(
+                TAG,
+                "Ignore stale UHF routed tag=0x%02x state=%d",
+                first_tag,
+                seader->uhf_sam_session.state);
+            return true;
+        }
+
+        if(first_tag == 0xAAU) {
+            SeaderUhfRoutedFrame routed = {0};
+            PluginUhfRequest request = {0};
+            PluginUhfResponse response = {0};
+            SeaderUhfBridgeCommand bridge_command = SeaderUhfBridgeCommandNone;
+
+            if(seader->uhf_sam_session.state != SeaderUhfSamSessionStateSentGetContentElement2 &&
+               seader->uhf_sam_session.state != SeaderUhfSamSessionStateWaitingBridge) {
+                FURI_LOG_W(
+                    TAG,
+                    "Ignore stale UHF routed command state=%d",
+                    seader->uhf_sam_session.state);
+                return true;
+            }
+
+            if(!seader_uhf_routed_try_parse_apdu(apdu, len, &routed)) {
+                seader_uhf_session_fail_bridge(
+                    seader,
+                    SeaderUhfBridgeCommandNone,
+                    SeaderUhfBridgeFailureSiteParse,
+                    0x0302U,
+                    0x00AAU);
+                return false;
+            }
+
+            request.bus_address = routed.bus_address;
+            switch(routed.command) {
+            case SeaderUhfRoutedCommandGetVersion:
+                request.command = PluginUhfCommandGetVersion;
+                bridge_command = SeaderUhfBridgeCommandGetVersion;
+                break;
+            case SeaderUhfRoutedCommandGetProperties:
+                request.command = PluginUhfCommandGetProperties;
+                bridge_command = SeaderUhfBridgeCommandGetProperties;
+                break;
+            case SeaderUhfRoutedCommandSetAccessPassword:
+                request.command = PluginUhfCommandSetAccessPassword;
+                bridge_command = SeaderUhfBridgeCommandSetAccessPassword;
+                request.command_value_len = routed.command_value_len;
+                memcpy(request.command_value, routed.command_value, routed.command_value_len);
+                break;
+            case SeaderUhfRoutedCommandGetPrivateData:
+                request.command = PluginUhfCommandGetPrivateData;
+                bridge_command = SeaderUhfBridgeCommandGetPrivateData;
+                break;
+            default:
+                seader_uhf_session_fail_bridge(
+                    seader,
+                    SeaderUhfBridgeCommandNone,
+                    SeaderUhfBridgeFailureSiteUnexpectedResponse,
+                    0x0303U,
+                    first_tag);
+                return false;
+            }
+
+            seader->uhf_sam_session.last_bridge_command = bridge_command;
+            FURI_LOG_I(
+                TAG,
+                "Handle UHF routed command %s",
+                seader_uhf_bridge_command_text(bridge_command));
+
+            if(!seader->plugin_uhf || !seader->uhf_plugin_ctx ||
+               !seader->plugin_uhf->handle_i2c_command(
+                   seader->uhf_plugin_ctx, &request, &response)) {
+                if(request.command == PluginUhfCommandGetPrivateData &&
+                   response.failure_reason != PluginUhfReadFailureReasonNone) {
+                    FURI_LOG_W(
+                        TAG,
+                        "UHF getPrivateData fail reason=%u stage=0x%04x",
+                        response.failure_reason,
+                        response.debug_stage);
+                    seader_uhf_session_fail(
+                        seader,
+                        response.failure_reason,
+                        0x0304U,
+                        response.debug_stage ? response.debug_stage : first_tag);
+                } else {
+                    seader_uhf_session_fail_bridge(
+                        seader,
+                        bridge_command,
+                        request.command == PluginUhfCommandGetPrivateData ?
+                            SeaderUhfBridgeFailureSitePrivateRead :
+                            SeaderUhfBridgeFailureSiteDispatch,
+                        0x0304U,
+                        first_tag);
+                }
+                return false;
+            }
+
+            if(!seader_send_uhf_routed_response(seader, routed.i2c_header, &response)) {
+                seader_uhf_session_fail_bridge(
+                    seader,
+                    bridge_command,
+                    SeaderUhfBridgeFailureSiteResponseSend,
+                    0x0305U,
+                    first_tag);
+                return false;
+            }
+
+            if(request.command == PluginUhfCommandSetAccessPassword) {
+                (void)seader_uhf_session_complete_key(
+                    seader, request.command_value, request.command_value_len);
+            } else if(request.command == PluginUhfCommandGetPrivateData) {
+                if(response.tid_len > sizeof(seader->uhf_sam_session.trace_tid)) {
+                    response.tid_len = sizeof(seader->uhf_sam_session.trace_tid);
+                }
+                memcpy(seader->uhf_sam_session.trace_tid, response.tid, response.tid_len);
+                seader->uhf_sam_session.trace_tid_len = (uint8_t)response.tid_len;
+                seader->uhf_sam_session.state = SeaderUhfSamSessionStateAwaitFinalSamResponse;
+            } else {
+                seader->uhf_sam_session.state = SeaderUhfSamSessionStateWaitingBridge;
+            }
+            return true;
+        }
+
+        if(first_tag != 0xA1U && first_tag != 0xBDU && first_tag != 0xBEU) {
+            seader_uhf_session_fail(
+                seader, PluginUhfReadFailureReasonInternalState, 0x0303U, first_tag);
+            return false;
+        }
+    }
+
     asn_dec_rval_t rval =
         asn_decode(0, ATS_DER, &asn_DEF_Payload, (void**)&payload_p, apdu + 6, len - 6);
     if(rval.code == RC_OK) {
@@ -1808,7 +2423,12 @@ bool seader_process_success_response_i(
         processed = seader_worker_state_machine(seader, &payload, online, spc);
     } else {
         SEADER_VERBOSE_HEX(FuriLogLevelDebug, TAG, "Failed to decode APDU payload", apdu, len);
-        seader_abort_active_read(seader);
+        if(seader->uhf_sam_session.active) {
+            seader_uhf_session_fail(
+                seader, PluginUhfReadFailureReasonInternalState, 0x0301U, (uint16_t)rval.code);
+        } else {
+            seader_abort_active_read(seader);
+        }
     }
 
     ASN_STRUCT_FREE_CONTENTS_ONLY(asn_DEF_Payload, &payload);

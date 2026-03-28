@@ -14,7 +14,15 @@ void seader_scene_read_on_enter(void* context) {
 
     // Setup view
     Popup* popup = seader->popup;
-    popup_set_header(popup, "Detecting\nHF card...", 68, 30, AlignLeft, AlignTop);
+    popup_set_header(
+        popup,
+        seader_hf_mode_get_selected_read_type(seader) == SeaderCredentialTypeUhf ?
+            "Detecting\nUHF card..." :
+            "Detecting\nHF card...",
+        68,
+        30,
+        AlignLeft,
+        AlignTop);
     popup_set_icon(popup, 0, 3, &I_RFIDDolphinReceive_97x61);
 
     // Start worker
@@ -50,6 +58,8 @@ bool seader_scene_read_on_event(void* context, SceneManagerEvent event) {
             consumed = true;
         } else if(event.event == SeaderWorkerEventHfTeardownComplete) {
             consumed = seader_hf_finish_teardown_action(seader);
+        } else if(event.event == SeaderWorkerEventUhfTeardownComplete) {
+            consumed = seader_uhf_finish_teardown_action(seader);
         } else if(event.event == SeaderCustomEventPollerDetect) {
             Popup* popup = seader->popup;
             popup_set_header(popup, "DON'T\nMOVE", 68, 30, AlignLeft, AlignTop);
@@ -63,7 +73,11 @@ bool seader_scene_read_on_event(void* context, SceneManagerEvent event) {
         }
     } else if(event.type == SceneManagerEventTypeBack) {
         seader_scene_read_abort_cleanup(seader);
-        consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+        if(seader_hf_mode_get_selected_read_type(seader) == SeaderCredentialTypeUhf) {
+            consumed = seader_uhf_request_teardown(seader, SeaderUhfTeardownActionSamPresent);
+        } else {
+            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+        }
     }
 
     return consumed;

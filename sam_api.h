@@ -15,6 +15,7 @@ typedef struct Seader Seader;
 typedef struct SeaderPollerContainer SeaderPollerContainer;
 
 #include <Payload.h>
+#include <Response.h>
 
 #define ExternalApplicationA 0x44
 #define NFCInterface         0x14
@@ -31,6 +32,13 @@ NfcCommand seader_worker_card_detect(
 
 void seader_send_nfc_rx(Seader* seader, uint8_t* buffer, size_t len);
 void seader_send_no_card_detected(Seader* seader);
+void seader_send_response(
+    Seader* seader,
+    Response_t* response,
+    uint8_t from,
+    uint8_t to,
+    uint8_t replyTo);
+bool seader_send_uhf_card_detected(Seader* seader, const uint8_t* sam_csn, size_t sam_csn_len);
 bool seader_sam_can_accept_card(const Seader* seader);
 bool seader_sam_has_active_card(const Seader* seader);
 void seader_sam_force_idle_for_recovery(Seader* seader);

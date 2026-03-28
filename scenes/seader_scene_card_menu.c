@@ -54,33 +54,44 @@ void seader_scene_card_menu_on_enter(void* context) {
 bool seader_scene_card_menu_on_event(void* context, SceneManagerEvent event) {
     Seader* seader = context;
     bool consumed = false;
+    const bool is_uhf = seader->credential->type == SeaderCredentialTypeUhf;
 
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == SubmenuIndexSave) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneCardMenu, SubmenuIndexSave);
             seader->credential->save_format = SeaderCredentialSaveFormatAgnostic;
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
+            consumed =
+                is_uhf ? seader_uhf_request_teardown(seader, SeaderUhfTeardownActionPrepareSave) :
+                         seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
         } else if(event.event == SubmenuIndexSavePicopass) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneCardMenu, SubmenuIndexSavePicopass);
             seader->credential->save_format = SeaderCredentialSaveFormatPicopass;
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
+            consumed =
+                is_uhf ? seader_uhf_request_teardown(seader, SeaderUhfTeardownActionPrepareSave) :
+                         seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
         } else if(event.event == SubmenuIndexSaveRFID) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneCardMenu, SubmenuIndexSaveRFID);
             seader->credential->save_format = SeaderCredentialSaveFormatRFID;
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
+            consumed =
+                is_uhf ? seader_uhf_request_teardown(seader, SeaderUhfTeardownActionPrepareSave) :
+                         seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
         } else if(event.event == SubmenuIndexSaveSR) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneCardMenu, SubmenuIndexSaveSR);
             seader->credential->save_format = SeaderCredentialSaveFormatSR;
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
+            consumed =
+                is_uhf ? seader_uhf_request_teardown(seader, SeaderUhfTeardownActionPrepareSave) :
+                         seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
         } else if(event.event == SubmenuIndexSaveMFC) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneCardMenu, SubmenuIndexSaveMFC);
             seader->credential->save_format = SeaderCredentialSaveFormatMFC;
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
+            consumed =
+                is_uhf ? seader_uhf_request_teardown(seader, SeaderUhfTeardownActionPrepareSave) :
+                         seader_hf_request_teardown(seader, SeaderHfTeardownActionPrepareSave);
         }
     } else if(event.type == SceneManagerEventTypeBack) {
         consumed = scene_manager_previous_scene(seader->scene_manager);

@@ -4,6 +4,13 @@
 
 #define TAG "SeaderSceneReadCardSuccess"
 
+static bool seader_scene_read_card_success_is_uhf_context(const Seader* seader) {
+    return seader && (seader_hf_mode_get_selected_read_type(seader) == SeaderCredentialTypeUhf ||
+                      seader->mode_runtime == SeaderModeRuntimeUHF ||
+                      seader->uhf_read_failure_reason != PluginUhfReadFailureReasonNone ||
+                      seader->credential->type == SeaderCredentialTypeUhf);
+}
+
 static bool seader_credential_is_picopass_sio_context(const SeaderCredential* credential) {
     return credential && (credential->type == SeaderCredentialTypePicopass ||
                           (credential->has_pacs_media_type &&
@@ -25,7 +32,9 @@ void seader_scene_read_card_success_widget_callback(
 void seader_scene_read_card_success_on_enter(void* context) {
     Seader* seader = context;
     SeaderCredential* credential = seader->credential;
-    PluginWiegand* plugin = seader_wiegand_plugin_acquire(seader) ? seader->plugin_wiegand : NULL;
+    PluginWiegand* plugin = credential->bit_length > 0 && seader_wiegand_plugin_acquire(seader) ?
+                                seader->plugin_wiegand :
+                                NULL;
     Widget* widget = seader_get_widget(seader);
     if(!widget) {
         FURI_LOG_E(TAG, "Widget view unavailable");
@@ -56,11 +65,11 @@ void seader_scene_read_card_success_on_enter(void* context) {
         furi_string_cat_printf(credential_str, "0x%llX", credential->credential);
         furi_string_set(type_str, seader_credential_get_type_label(credential));
     } else {
-        furi_string_set(type_str, "Read error");
+        furi_string_set(
+            type_str,
+            seader_scene_read_card_success_is_uhf_context(seader) ? "UHF read error" :
+                                                                    "Read error");
         furi_string_set(bitlength_str, seader->read_error[0] ? seader->read_error : "Read failed");
-
-        seader_t_1_reset(seader->uart);
-        seader_ccid_check_for_sam(seader->uart);
     }
 
     widget_add_button_element(
@@ -147,12 +156,22 @@ bool seader_scene_read_card_success_on_event(void* context, SceneManagerEvent ev
 
     if(event.type == SceneManagerEventTypeCustom) {
         if(event.event == GuiButtonTypeLeft) {
-            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionRestartRead);
+            if(seader_scene_read_card_success_is_uhf_context(seader)) {
+                consumed = seader_uhf_request_teardown(seader, SeaderUhfTeardownActionRestartRead);
+            } else {
+                consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionRestartRead);
+            }
         } else if(event.event == GuiButtonTypeRight) {
             if(seader->credential->bit_length > 0) {
                 scene_manager_next_scene(seader->scene_manager, SeaderSceneCardMenu);
             } else {
-                consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+                if(seader_scene_read_card_success_is_uhf_context(seader)) {
+                    consumed =
+                        seader_uhf_request_teardown(seader, SeaderUhfTeardownActionSamPresent);
+                } else {
+                    consumed =
+                        seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+                }
             }
             if(seader->credential->bit_length > 0) {
                 consumed = true;
@@ -162,9 +181,15 @@ bool seader_scene_read_card_success_on_event(void* context, SceneManagerEvent ev
             consumed = true;
         } else if(event.event == SeaderWorkerEventHfTeardownComplete) {
             consumed = seader_hf_finish_teardown_action(seader);
+        } else if(event.event == SeaderWorkerEventUhfTeardownComplete) {
+            consumed = seader_uhf_finish_teardown_action(seader);
         }
     } else if(event.type == SceneManagerEventTypeBack) {
-        consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+        if(seader_scene_read_card_success_is_uhf_context(seader)) {
+            consumed = seader_uhf_request_teardown(seader, SeaderUhfTeardownActionSamPresent);
+        } else {
+            consumed = seader_hf_request_teardown(seader, SeaderHfTeardownActionSamPresent);
+        }
     }
     return consumed;
 }

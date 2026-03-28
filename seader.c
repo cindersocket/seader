@@ -4,11 +4,14 @@
 #include "hf_read_lifecycle.h"
 #include "sam_startup_ui.h"
 #include "trace_log.h"
+#include "uhf_read_lifecycle.h"
+#include <Response.h>
 
 #define TAG                                       "Seader"
 #define SEADER_PLUGIN_DIR                         APP_ASSETS_PATH("plugins")
 #define SEADER_WIEGAND_PLUGIN_PATH                APP_ASSETS_PATH("plugins/plugin_wiegand.fal")
 #define SEADER_HF_PLUGIN_PATH                     APP_ASSETS_PATH("plugins/plugin_hf.fal")
+#define SEADER_UHF_PLUGIN_PATH                    APP_ASSETS_PATH("plugins/plugin_uhf.fal")
 #define SEADER_BOARD_POWER_SETTLE_MS              250U
 #define SEADER_BOARD_ENABLE_SETTLE_MS             150U
 #define SEADER_BOARD_RETRY_COOLDOWN_MS            100U
@@ -22,8 +25,12 @@ typedef struct {
 } SeaderHfPicopassDetectContext;
 
 static void seader_hf_worker_event_callback(uint32_t event, void* context);
+static void seader_uhf_worker_event_callback(uint32_t event, void* context);
 static void seader_hf_teardown_blocking(Seader* seader);
+static void seader_uhf_teardown_blocking(Seader* seader);
 static bool seader_hf_has_runtime(const Seader* seader);
+static bool seader_uhf_has_runtime(const Seader* seader);
+static bool seader_has_read_runtime(const Seader* seader);
 static void seader_hf_read_reset(Seader* seader);
 static void seader_hf_read_note_progress(Seader* seader);
 static void seader_hf_read_fail(Seader* seader, SeaderHfReadFailureReason reason);
@@ -166,7 +173,7 @@ static bool seader_board_auto_recover_begin(Seader* seader) {
         return false;
     }
 
-    const bool resume_read = seader_hf_has_runtime(seader);
+    const bool resume_read = seader_has_read_runtime(seader);
     seader->board_auto_recover_pending = true;
     seader->board_auto_recover_resume_read = resume_read;
     seader->board_auto_recover_read_type =
@@ -213,7 +220,11 @@ static bool seader_board_handle_runtime_power_lost(Seader* seader) {
     seader_hf_read_fail(seader, SeaderHfReadFailureReasonBoardMissing);
     seader_sam_force_idle_for_recovery(seader);
 
-    if(seader_hf_has_runtime(seader)) {
+    if(seader_has_read_runtime(seader)) {
+        if(seader->mode_runtime == SeaderModeRuntimeUHF ||
+           seader_hf_mode_get_selected_read_type(seader) == SeaderCredentialTypeUhf) {
+            return seader_uhf_request_teardown(seader, SeaderUhfTeardownActionBoardMissing);
+        }
         return seader_hf_request_teardown(seader, SeaderHfTeardownActionBoardMissing);
     }
 
@@ -796,6 +807,39 @@ static void seader_hf_plugin_set_read_error(void* host_ctx, const char* text) {
     strlcpy(seader->read_error, text, sizeof(seader->read_error));
 }
 
+static bool seader_uhf_plugin_sam_can_accept_card(void* host_ctx) {
+    return seader_sam_can_accept_card(host_ctx);
+}
+
+static bool seader_uhf_plugin_send_card_detected(
+    void* host_ctx,
+    const uint8_t* sam_csn,
+    size_t sam_csn_len) {
+    return seader_send_uhf_card_detected(host_ctx, sam_csn, sam_csn_len);
+}
+
+static void seader_uhf_plugin_set_credential_type(void* host_ctx, SeaderCredentialType type) {
+    Seader* seader = host_ctx;
+    if(!seader || !seader->credential) {
+        return;
+    }
+
+    seader->credential->type = type;
+    seader->credential->bit_length = 0U;
+    seader->credential->credential = 0U;
+    seader->credential->sio_len = 0U;
+}
+
+static void seader_uhf_plugin_set_pacs_media_type(void* host_ctx, SeaderPacsMediaType type) {
+    Seader* seader = host_ctx;
+    if(!seader || !seader->credential) {
+        return;
+    }
+
+    seader->credential->has_pacs_media_type = true;
+    seader->credential->pacs_media_type = type;
+}
+
 static const PluginHfHostApi seader_hf_plugin_host_api = {
     .notify_worker_exit = seader_hf_plugin_notify_worker_exit,
     .begin_card_session = seader_hf_plugin_begin_card_session,
@@ -819,7 +863,23 @@ static const PluginHfHostApi seader_hf_plugin_host_api = {
     .set_read_error = seader_hf_plugin_set_read_error,
 };
 
+static const PluginUhfHostApi seader_uhf_plugin_host_api = {
+    .sam_can_accept_card = seader_uhf_plugin_sam_can_accept_card,
+    .send_card_detected = seader_uhf_plugin_send_card_detected,
+    .set_credential_type = seader_uhf_plugin_set_credential_type,
+    .set_pacs_media_type = seader_uhf_plugin_set_pacs_media_type,
+};
+
 static void seader_hf_worker_event_callback(uint32_t event, void* context) {
+    Seader* seader = context;
+    if(!seader || !seader->view_dispatcher) {
+        return;
+    }
+
+    view_dispatcher_send_custom_event(seader->view_dispatcher, event);
+}
+
+static void seader_uhf_worker_event_callback(uint32_t event, void* context) {
     Seader* seader = context;
     if(!seader || !seader->view_dispatcher) {
         return;
@@ -840,6 +900,20 @@ static void seader_hf_session_force_unloaded(Seader* seader) {
     seader->picopass_poller = NULL;
     seader->hf_session_state = SeaderHfSessionStateUnloaded;
     if(seader->mode_runtime == SeaderModeRuntimeHF) {
+        seader->mode_runtime = SeaderModeRuntimeNone;
+    }
+}
+
+static void seader_uhf_session_force_unloaded(Seader* seader) {
+    if(!seader) {
+        return;
+    }
+
+    seader->uhf_plugin_ctx = NULL;
+    seader->plugin_uhf = NULL;
+    seader->uhf_plugin_manager = NULL;
+    seader->uhf_session_state = SeaderUhfSessionStateUnloaded;
+    if(seader->mode_runtime == SeaderModeRuntimeUHF) {
         seader->mode_runtime = SeaderModeRuntimeNone;
     }
 }
@@ -896,6 +970,53 @@ static void seader_hf_release_worker_reset(void* context) {
     if(seader && seader->worker) {
         seader_worker_reset_poller_session(seader->worker);
     }
+}
+
+static void seader_uhf_release_plugin_stop(void* context) {
+    Seader* seader = context;
+    if(seader && seader->plugin_uhf && seader->uhf_plugin_ctx) {
+        seader->plugin_uhf->stop(seader->uhf_plugin_ctx);
+    }
+}
+
+static void seader_uhf_release_plugin_free(void* context) {
+    Seader* seader = context;
+    if(seader && seader->plugin_uhf && seader->uhf_plugin_ctx) {
+        seader->plugin_uhf->free(seader->uhf_plugin_ctx);
+    }
+    if(seader) {
+        seader->uhf_plugin_ctx = NULL;
+        seader->plugin_uhf = NULL;
+    }
+}
+
+static void seader_uhf_release_plugin_manager(void* context) {
+    Seader* seader = context;
+    if(seader && seader->uhf_plugin_manager) {
+        FURI_LOG_I(TAG, "Unloading UHF plugin");
+        plugin_manager_free(seader->uhf_plugin_manager);
+        seader->uhf_plugin_manager = NULL;
+    }
+}
+
+static void seader_uhf_release_worker_reset(void* context) {
+    Seader* seader = context;
+    if(seader && seader->worker) {
+        seader_worker_reset_poller_session(seader->worker);
+    }
+}
+
+static bool seader_hf_has_runtime(const Seader* seader) {
+    return seader && (seader->hf_plugin_manager || seader->plugin_hf || seader->hf_plugin_ctx ||
+                      seader->poller || seader->picopass_poller);
+}
+
+static bool seader_uhf_has_runtime(const Seader* seader) {
+    return seader && (seader->uhf_plugin_manager || seader->plugin_uhf || seader->uhf_plugin_ctx);
+}
+
+static bool seader_has_read_runtime(const Seader* seader) {
+    return seader_hf_has_runtime(seader) || seader_uhf_has_runtime(seader);
 }
 
 bool seader_custom_event_callback(void* context, uint32_t event) {
@@ -1036,9 +1157,14 @@ Seader* seader_alloc() {
     seader->hf_plugin_manager = NULL;
     seader->plugin_hf = NULL;
     seader->hf_plugin_ctx = NULL;
+    seader->uhf_plugin_manager = NULL;
+    seader->plugin_uhf = NULL;
+    seader->uhf_plugin_ctx = NULL;
     seader->mode_runtime = SeaderModeRuntimeNone;
     seader->hf_session_state = SeaderHfSessionStateUnloaded;
+    seader->uhf_session_state = SeaderUhfSessionStateUnloaded;
     seader->hf_teardown_action = SeaderHfTeardownActionNone;
+    seader->uhf_teardown_action = SeaderUhfTeardownActionNone;
     seader_hf_read_reset(seader);
     seader->loading_popup_enabled = true;
     seader->start_scene_active = false;
@@ -1064,6 +1190,7 @@ void seader_free(Seader* seader) {
 
     seader->loading_popup_enabled = false;
     seader_hf_teardown_blocking(seader);
+    seader_uhf_teardown_blocking(seader);
     seader_hf_mode_deactivate(seader);
     seader_worker_release(seader);
     if(seader->worker) {
@@ -1344,9 +1471,74 @@ bool seader_hf_plugin_acquire(Seader* seader) {
     return true;
 }
 
-static bool seader_hf_has_runtime(const Seader* seader) {
-    return seader && (seader->hf_plugin_manager || seader->plugin_hf || seader->hf_plugin_ctx ||
-                      seader->poller || seader->picopass_poller);
+bool seader_uhf_plugin_acquire(Seader* seader) {
+    furi_assert(seader);
+
+    if(seader->mode_runtime == SeaderModeRuntimeHF) {
+        FURI_LOG_W(TAG, "Reject UHF plugin acquire while HF runtime is active");
+        return false;
+    }
+
+    if(seader->uhf_session_state == SeaderUhfSessionStateTearingDown) {
+        FURI_LOG_W(TAG, "Reject UHF plugin acquire during teardown");
+        return false;
+    }
+
+    if(seader->plugin_uhf && seader->uhf_plugin_ctx) {
+        if(seader->uhf_session_state == SeaderUhfSessionStateUnloaded) {
+            seader->uhf_session_state = SeaderUhfSessionStateLoaded;
+        }
+        seader->mode_runtime = SeaderModeRuntimeUHF;
+        return true;
+    }
+
+    if(seader->uhf_plugin_manager || seader->plugin_uhf || seader->uhf_plugin_ctx) {
+        FURI_LOG_W(
+            TAG,
+            "Normalize partial UHF session manager=%p plugin=%p ctx=%p state=%d",
+            (void*)seader->uhf_plugin_manager,
+            (void*)seader->plugin_uhf,
+            seader->uhf_plugin_ctx,
+            seader->uhf_session_state);
+        seader_uhf_plugin_release(seader);
+    }
+
+    seader->uhf_plugin_manager =
+        plugin_manager_alloc(UHF_PLUGIN_APP_ID, UHF_PLUGIN_API_VERSION, firmware_api_interface);
+    if(!seader->uhf_plugin_manager) {
+        FURI_LOG_E(TAG, "Failed to allocate UHF plugin manager");
+        return false;
+    }
+
+    FURI_LOG_I(TAG, "Loading UHF plugin from %s", SEADER_UHF_PLUGIN_PATH);
+    if(plugin_manager_load_single(seader->uhf_plugin_manager, SEADER_UHF_PLUGIN_PATH) !=
+       PluginManagerErrorNone) {
+        FURI_LOG_E(TAG, "Failed to load UHF plugin");
+        plugin_manager_free(seader->uhf_plugin_manager);
+        seader_uhf_session_force_unloaded(seader);
+        return false;
+    }
+
+    seader->plugin_uhf = (PluginUhf*)plugin_manager_get_ep(seader->uhf_plugin_manager, 0);
+    if(!seader->plugin_uhf) {
+        FURI_LOG_E(TAG, "Failed to resolve UHF plugin entry point");
+        plugin_manager_free(seader->uhf_plugin_manager);
+        seader_uhf_session_force_unloaded(seader);
+        return false;
+    }
+
+    seader->uhf_plugin_ctx = seader->plugin_uhf->alloc(&seader_uhf_plugin_host_api, seader);
+    if(!seader->uhf_plugin_ctx) {
+        FURI_LOG_E(TAG, "Failed to allocate UHF plugin context");
+        plugin_manager_free(seader->uhf_plugin_manager);
+        seader_uhf_session_force_unloaded(seader);
+        return false;
+    }
+
+    seader->uhf_session_state = SeaderUhfSessionStateLoaded;
+    seader->mode_runtime = SeaderModeRuntimeUHF;
+    FURI_LOG_I(TAG, "UHF plugin loaded: %s", seader->plugin_uhf->name);
+    return true;
 }
 
 /* App shutdown uses the same teardown primitive as normal navigation. The only difference
@@ -1369,6 +1561,24 @@ static void seader_hf_teardown_blocking(Seader* seader) {
     seader_worker_join(seader->worker);
 }
 
+static void seader_uhf_teardown_blocking(Seader* seader) {
+    if(!seader || !seader_uhf_has_runtime(seader)) {
+        return;
+    }
+
+    seader->uhf_session_state = SeaderUhfSessionStateTearingDown;
+    if(!seader_worker_acquire(seader) || !seader->worker || !seader->uart) {
+        FURI_LOG_W(TAG, "UHF blocking teardown fallback");
+        seader_uhf_plugin_release(seader);
+        return;
+    }
+
+    seader_worker_stop(seader->worker);
+    FURI_LOG_I(TAG, "UHF teardown blocking");
+    seader_worker_start(seader->worker, SeaderWorkerStateUhfTeardown, seader->uart, NULL, seader);
+    seader_worker_join(seader->worker);
+}
+
 /* All HF runtime shutdown funnels through the canonical release sequence so stop/free/unload
    order cannot silently diverge between code paths. */
 void seader_hf_plugin_release(Seader* seader) {
@@ -1387,24 +1597,42 @@ void seader_hf_plugin_release(Seader* seader) {
     seader_hf_release_sequence_run(&release_sequence);
 }
 
-/* Teardown completion is the single place that collapses HF UI/runtime mode back into
-   ordinary app navigation. Scenes request teardown targets; they do not perform teardown. */
-bool seader_hf_finish_teardown_action(Seader* seader) {
+void seader_uhf_plugin_release(Seader* seader) {
+    furi_assert(seader);
+
+    seader_uhf_release_plugin_stop(seader);
+    seader_uhf_release_plugin_free(seader);
+    seader_uhf_release_plugin_manager(seader);
+    seader_uhf_release_worker_reset(seader);
+    seader_uhf_session_force_unloaded(seader);
+}
+
+static bool seader_finish_hf_teardown_action(Seader* seader) {
     if(!seader) {
         return false;
     }
 
-    FURI_LOG_I(TAG, "HF teardown complete action=%d", seader->hf_teardown_action);
-    seader_show_loading_popup(seader, false);
-    seader_hf_mode_reset(seader);
-
     const SeaderHfTeardownAction action = seader->hf_teardown_action;
     seader->hf_teardown_action = SeaderHfTeardownActionNone;
+    const bool preserve_read_type = action == SeaderHfTeardownActionRestartRead;
+
+    FURI_LOG_I(TAG, "Read teardown complete action=%d", action);
+    seader_show_loading_popup(seader, false);
+    if(!preserve_read_type) {
+        seader_hf_mode_reset(seader);
+    } else {
+        seader_hf_mode_clear_detected_types(seader);
+    }
 
     switch(action) {
     case SeaderHfTeardownActionSamPresent:
-        return scene_manager_search_and_switch_to_another_scene(
-            seader->scene_manager, SeaderSceneSamPresent);
+        seader->sam_present_menu_guard_active = true;
+        if(scene_manager_search_and_switch_to_another_scene(
+               seader->scene_manager, SeaderSceneSamPresent)) {
+            return true;
+        }
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneSamPresent);
+        return true;
     case SeaderHfTeardownActionBoardMissing:
         return scene_manager_search_and_switch_to_another_scene(
             seader->scene_manager, SeaderSceneSamMissing);
@@ -1423,6 +1651,61 @@ bool seader_hf_finish_teardown_action(Seader* seader) {
         view_dispatcher_stop(seader->view_dispatcher);
         return true;
     case SeaderHfTeardownActionNone:
+    default:
+        return false;
+    }
+}
+
+/* Teardown completion is the single place that collapses HF UI/runtime mode back into
+   ordinary app navigation. Scenes request teardown targets; they do not perform teardown. */
+bool seader_hf_finish_teardown_action(Seader* seader) {
+    return seader_finish_hf_teardown_action(seader);
+}
+
+bool seader_uhf_finish_teardown_action(Seader* seader) {
+    if(!seader) {
+        return false;
+    }
+
+    const SeaderUhfTeardownAction action = seader->uhf_teardown_action;
+    seader->uhf_teardown_action = SeaderUhfTeardownActionNone;
+    const bool preserve_read_type = action == SeaderUhfTeardownActionRestartRead;
+
+    FURI_LOG_I(TAG, "UHF teardown complete action=%d", action);
+    seader_show_loading_popup(seader, false);
+    if(!preserve_read_type) {
+        seader_hf_mode_reset(seader);
+    } else {
+        seader_hf_mode_clear_detected_types(seader);
+    }
+
+    switch(action) {
+    case SeaderUhfTeardownActionSamPresent:
+        seader->sam_present_menu_guard_active = true;
+        if(scene_manager_search_and_switch_to_another_scene(
+               seader->scene_manager, SeaderSceneSamPresent)) {
+            return true;
+        }
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneSamPresent);
+        return true;
+    case SeaderUhfTeardownActionBoardMissing:
+        return scene_manager_search_and_switch_to_another_scene(
+            seader->scene_manager, SeaderSceneSamMissing);
+    case SeaderUhfTeardownActionAutoRecover:
+        seader->board_status = SeaderBoardStatusRetryRequested;
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneStart);
+        return true;
+    case SeaderUhfTeardownActionPrepareSave:
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneSaveName);
+        return true;
+    case SeaderUhfTeardownActionRestartRead:
+        scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
+        return true;
+    case SeaderUhfTeardownActionStopApp:
+        scene_manager_stop(seader->scene_manager);
+        view_dispatcher_stop(seader->view_dispatcher);
+        return true;
+    case SeaderUhfTeardownActionNone:
     default:
         return false;
     }
@@ -1463,6 +1746,46 @@ bool seader_hf_request_teardown(Seader* seader, SeaderHfTeardownAction action) {
         SeaderWorkerStateHfTeardown,
         seader->uart,
         seader_hf_worker_event_callback,
+        seader);
+    return true;
+}
+
+bool seader_uhf_request_teardown(Seader* seader, SeaderUhfTeardownAction action) {
+    furi_assert(seader);
+
+    FURI_LOG_I(
+        TAG,
+        "UHF teardown requested action=%d state=%d worker_state=%d",
+        action,
+        seader->uhf_session_state,
+        seader->worker ? seader_worker_get_state(seader->worker) : -1);
+
+    seader->uhf_teardown_action = action;
+    if(action == SeaderUhfTeardownActionSamPresent) {
+        seader->sam_present_menu_guard_active = true;
+    }
+    if(!seader_uhf_has_runtime(seader)) {
+        seader->uhf_session_state = SeaderUhfSessionStateUnloaded;
+        return seader_uhf_finish_teardown_action(seader);
+    }
+
+    if(!seader_worker_acquire(seader)) {
+        return seader_uhf_finish_teardown_action(seader);
+    }
+
+    if(seader->uhf_session_state == SeaderUhfSessionStateTearingDown ||
+       (seader->worker &&
+        seader_worker_get_state(seader->worker) == SeaderWorkerStateUhfTeardown)) {
+        return true;
+    }
+
+    seader->uhf_session_state = SeaderUhfSessionStateTearingDown;
+    seader_worker_stop(seader->worker);
+    seader_worker_start(
+        seader->worker,
+        SeaderWorkerStateUhfTeardown,
+        seader->uart,
+        seader_uhf_worker_event_callback,
         seader);
     return true;
 }

@@ -22,6 +22,9 @@ App(
       "aeabi_uldivmod.sx",
       "!hf_interface_fal/*.c",
       "!runtime_policy.c",
+      "!uhf_interface_fal/*.c",
+      "!uhf_module.c",
+      "!uhf_uart.c",
       "!wiegand_interface_fal/*.c",
     ],
     fap_icon="icons/logo.png",
@@ -72,5 +75,21 @@ App(
     entry_point="plugin_hf_ep",
     requires=["seader"],
     sources=["hf_interface_fal/hf.c"],
+    fal_embedded=True,
+)
+
+App(
+    appid="plugin_uhf",
+    apptype=FlipperAppType.PLUGIN,
+    entry_point="plugin_uhf_ep",
+    requires=["seader"],
+    sources=[
+        "uhf_interface_fal/uhf.c",
+        "uhf_module.c",
+        "uhf_uart.c",
+        "uhf_frame.c",
+        "uhf_logic.c",
+        "uhf_session_lifecycle.c",
+    ],
     fal_embedded=True,
 )

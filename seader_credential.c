@@ -93,6 +93,8 @@ const char* seader_credential_get_type_label(const SeaderCredential* cred) {
             return "MIFARE Plus";
         case SeaderPacsMediaTypeSeos:
             return "Seos";
+        case SeaderPacsMediaTypeUhf:
+            return "UHF";
         }
     }
 
@@ -105,6 +107,8 @@ const char* seader_credential_get_type_label(const SeaderCredential* cred) {
         return "14443A";
     case SeaderCredentialTypeMifareClassic:
         return "Mifare Classic";
+    case SeaderCredentialTypeUhf:
+        return "UHF";
     case SeaderCredentialTypeVirtual:
         return "Virtual";
     case SeaderCredentialTypeConfig:
