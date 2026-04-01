@@ -1,0 +1,230 @@
+#include "protocol.h"
+
+#include <string.h>
+
+#define HX_CCID_HEADER_LEN 10U
+#define HX_WIRE_HEADER_LEN (2U + HX_CCID_HEADER_LEN)
+
+static uint32_t hx_read_le32(const uint8_t* data) {
+    return ((uint32_t)data[0]) | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+uint8_t hx_calc_lrc(const uint8_t* data, size_t len) {
+    uint8_t lrc = 0U;
+
+    for(size_t i = 0; i < len; i++) {
+        lrc ^= data[i];
+    }
+
+    return lrc;
+}
+
+bool hx_validate_lrc(const uint8_t* data, size_t len) {
+    if(len == 0U) {
+        return false;
+    }
+
+    return hx_calc_lrc(data, len - 1U) == data[len - 1U];
+}
+
+size_t hx_add_lrc(uint8_t* data, size_t len) {
+    data[len] = hx_calc_lrc(data, len);
+    return len + 1U;
+}
+
+HxFrameState
+    hx_ccid_frame_state(const uint8_t* data, size_t len, size_t max_frame_len, size_t* frame_len) {
+    if(frame_len) {
+        *frame_len = 0U;
+    }
+
+    if(len < 2U) {
+        return HxFrameStateNeedMore;
+    }
+
+    if(data[0] != HX_SYNC || data[1] != HX_CTRL) {
+        return HxFrameStateDesync;
+    }
+
+    if(len < HX_WIRE_HEADER_LEN) {
+        return HxFrameStateNeedMore;
+    }
+
+    const uint32_t payload_len = hx_read_le32(&data[3]);
+    if((size_t)payload_len > SIZE_MAX - (HX_WIRE_HEADER_LEN + 1U)) {
+        return HxFrameStateInvalidLength;
+    }
+
+    const size_t total_len = HX_WIRE_HEADER_LEN + (size_t)payload_len + 1U;
+    if(total_len > max_frame_len) {
+        if(frame_len) {
+            *frame_len = total_len;
+        }
+        return HxFrameStateInvalidLength;
+    }
+
+    if(frame_len) {
+        *frame_len = total_len;
+    }
+
+    if(len < total_len) {
+        return HxFrameStateNeedMore;
+    }
+
+    return HxFrameStateReady;
+}
+
+bool hx_ccid_is_escape_frame(const uint8_t* frame, size_t frame_len) {
+    size_t parsed_len = 0U;
+    if(hx_ccid_frame_state(frame, frame_len, frame_len, &parsed_len) != HxFrameStateReady) {
+        return false;
+    }
+
+    return frame[2] == HX_CCID_PC_TO_RDR_ESCAPE;
+}
+
+bool hx_parse_request_payload(const uint8_t* payload, size_t payload_len, HxRequest* request) {
+    if(!payload || !request || payload_len < 4U) {
+        return false;
+    }
+
+    if(payload[0] != HX_REQUEST_MAGIC_0 || payload[1] != HX_REQUEST_MAGIC_1 ||
+       payload[2] != HX_PROTOCOL_VERSION) {
+        return false;
+    }
+
+    request->opcode = payload[3];
+    request->body = payload + 4U;
+    request->body_len = payload_len - 4U;
+    return true;
+}
+
+bool hx_copy_response_body(
+    const uint8_t* body,
+    size_t body_len,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    if(out_len) {
+        *out_len = 0U;
+    }
+
+    if(body_len > 0U && (!body || !out || body_len > out_cap)) {
+        return false;
+    }
+
+    if(body_len > 0U) {
+        memcpy(out, body, body_len);
+    }
+
+    if(out_len) {
+        *out_len = body_len;
+    }
+
+    return true;
+}
+
+size_t hx_build_hf14a_scan_payload(
+    const uint8_t* uid,
+    size_t uid_len,
+    const uint8_t atqa[2],
+    uint8_t sak,
+    const uint8_t* ats,
+    size_t ats_len,
+    uint8_t* out,
+    size_t out_cap) {
+    const size_t total_len = 5U + uid_len + ats_len;
+
+    if(!uid || !atqa || !out || uid_len > 255U || ats_len > 255U || out_cap < total_len) {
+        return 0U;
+    }
+
+    out[0] = (uint8_t)uid_len;
+    memcpy(out + 1U, uid, uid_len);
+    out[1U + uid_len] = atqa[0];
+    out[2U + uid_len] = atqa[1];
+    out[3U + uid_len] = sak;
+    out[4U + uid_len] = (uint8_t)ats_len;
+    if(ats_len > 0U) {
+        if(!ats) {
+            return 0U;
+        }
+        memcpy(out + 5U + uid_len, ats, ats_len);
+    }
+
+    return total_len;
+}
+
+size_t hx_build_response_payload(
+    uint8_t opcode,
+    uint8_t status,
+    const uint8_t* body,
+    size_t body_len,
+    uint8_t* out,
+    size_t out_cap) {
+    const size_t total_len = 5U + body_len;
+
+    if(!out || out_cap < total_len) {
+        return 0U;
+    }
+
+    out[0] = HX_REQUEST_MAGIC_0;
+    out[1] = HX_REQUEST_MAGIC_1;
+    out[2] = HX_PROTOCOL_VERSION;
+    out[3] = opcode;
+    out[4] = status;
+
+    if(body_len > 0U && body) {
+        for(size_t i = 0U; i < body_len; i++) {
+            out[5U + i] = body[i];
+        }
+    }
+
+    return total_len;
+}
+
+size_t hx_build_ccid_escape_response(
+    const uint8_t* request_frame,
+    size_t request_frame_len,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint8_t* out,
+    size_t out_cap) {
+    size_t frame_len = 0U;
+
+    if(!request_frame || !out ||
+       hx_ccid_frame_state(request_frame, request_frame_len, request_frame_len, &frame_len) !=
+           HxFrameStateReady ||
+       frame_len != request_frame_len) {
+        return 0U;
+    }
+
+    const size_t total_len = HX_WIRE_HEADER_LEN + payload_len + 1U;
+    if(out_cap < total_len) {
+        return 0U;
+    }
+
+    for(size_t i = 0U; i < total_len; i++) {
+        out[i] = 0U;
+    }
+
+    out[0] = HX_SYNC;
+    out[1] = HX_CTRL;
+    out[2] = HX_CCID_RDR_TO_PC_ESCAPE;
+    out[3] = (uint8_t)(payload_len & 0xffU);
+    out[4] = (uint8_t)((payload_len >> 8) & 0xffU);
+    out[5] = (uint8_t)((payload_len >> 16) & 0xffU);
+    out[6] = (uint8_t)((payload_len >> 24) & 0xffU);
+    out[7] = request_frame[7];
+    out[8] = request_frame[8];
+    out[9] = 0U;
+    out[10] = 0U;
+    out[11] = 0U;
+
+    for(size_t i = 0U; i < payload_len; i++) {
+        out[HX_WIRE_HEADER_LEN + i] = payload[i];
+    }
+
+    return hx_add_lrc(out, HX_WIRE_HEADER_LEN + payload_len);
+}

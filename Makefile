@@ -26,17 +26,19 @@ test-host:
 		lib/host_tests/test_t1_existing.c \
 		lib/host_tests/test_t1_protocol.c \
 		lib/host_tests/test_snmp.c \
-			lib/host_tests/test_uhf_status_label.c \
-			lib/host_tests/test_credential_sio_label.c \
-			lib/host_tests/test_hf_read_plan.c \
-			lib/host_tests/test_wiegand_plugin.c \
-			lib/host_tests/test_runtime_policy.c \
+		lib/host_tests/test_uhf_status_label.c \
+		lib/host_tests/test_credential_sio_label.c \
+		lib/host_tests/test_hf_read_plan.c \
+		lib/host_tests/test_wiegand_plugin.c \
+		lib/host_tests/test_runtime_policy.c \
+		lib/host_tests/test_hardware_exerciser_protocol.c \
 		lib/host_tests/t1_test_stubs.c \
 		lib/host_tests/bit_buffer_mock.c \
-			lrc.c \
-			board_power_lifecycle.c \
-			sam_startup_ui.c \
-			ccid_logic.c \
+		lrc.c \
+		board_power_lifecycle.c \
+		sam_startup_ui.c \
+		ccid_logic.c \
+		hardware_exerciser/protocol.c \
 		credential_sio_label.c \
 		t_1_logic.c \
 		t_1.c \
@@ -44,12 +46,12 @@ test-host:
 		snmp_ber_view.c \
 		snmp_codec.c \
 		snmp_response_view.c \
-			uhf_status_label.c \
-			uhf_tag_config_view.c \
-			uhf_snmp_probe.c \
-			hf_read_lifecycle.c \
-			seader_hf_read_plan.c \
-			wiegand_interface_fal/wiegand.c \
+		uhf_status_label.c \
+		uhf_tag_config_view.c \
+		uhf_snmp_probe.c \
+		hf_read_lifecycle.c \
+		seader_hf_read_plan.c \
+		wiegand_interface_fal/wiegand.c \
 		runtime_policy.c \
 		-o build/host_tests/seader_tests
 	./build/host_tests/seader_tests

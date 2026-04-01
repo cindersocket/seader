@@ -14,6 +14,7 @@ extern MunitSuite test_credential_sio_label_suite;
 extern MunitSuite test_hf_read_plan_suite;
 extern MunitSuite test_runtime_policy_suite;
 extern MunitSuite test_wiegand_plugin_suite;
+extern MunitSuite test_hardware_exerciser_protocol_suite;
 
 int main(int argc, char* argv[]) {
     MunitSuite child_suites[] = {
@@ -43,6 +44,7 @@ int main(int argc, char* argv[]) {
         {"/hf-read-plan", test_hf_read_plan_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/runtime-policy", test_runtime_policy_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {"/wiegand-plugin", test_wiegand_plugin_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
+        {"/hardware-exerciser", test_hardware_exerciser_protocol_suite.tests, NULL, 1, MUNIT_SUITE_OPTION_NONE},
         {NULL, NULL, NULL, 0, 0},
     };
     MunitSuite main_suite = {

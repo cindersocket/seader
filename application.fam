@@ -74,3 +74,23 @@ App(
     sources=["hf_interface_fal/hf.c"],
     fal_embedded=True,
 )
+
+App(
+    appid="hardware_exerciser",
+    name="HardwareExerciser",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="hardware_exerciser_app",
+    requires=[
+        "gui",
+        "nfc",
+    ],
+    stack_size=6 * 1024,
+    order=21,
+    sources=[
+        "hardware_exerciser/*.c",
+    ],
+    fap_icon="icons/logo.png",
+    fap_category="Tools",
+    fap_version="1.0",
+    fap_author="bettse",
+)
