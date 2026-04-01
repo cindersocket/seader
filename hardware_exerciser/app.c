@@ -22,6 +22,15 @@
 #include <lib/nfc/protocols/iso15693_3/iso15693_3_poller.h>
 #include <lib/toolbox/simple_array.h>
 
+/*
+ * HardwareExerciser is a dual bridge:
+ * - CDC0 terminates a small protocol carried inside CCID escape frames and forwards non-escape
+ *   traffic to the SAM UART.
+ * - CDC1 is a raw passthrough to the UHF UART.
+ *
+ * The app keeps protocol framing in this file and isolates wire helpers in protocol.c so host
+ * tooling and host tests can validate the message layout independently from the firmware runtime.
+ */
 #define TAG "HardwareExerciser"
 
 #define HE_BAUDRATE 115200U
@@ -31,6 +40,7 @@
 #define HE_WAIT_TIMEOUT_MS 1000U
 #define HE_14A_ATS_MAX 64U
 
+/* Cross-thread events shared by the per-bridge worker thread and its CDC RX helper thread. */
 typedef enum {
     HeWorkerEvtStop = (1 << 0),
     HeWorkerEvtRxDone = (1 << 1),
@@ -57,6 +67,12 @@ typedef enum {
 
 typedef struct HardwareExerciserApp HardwareExerciserApp;
 
+/*
+ * Per-bridge runtime state.
+ *
+ * The worker thread owns UART RX processing and sends data back to USB. The TX thread drains
+ * host-side CDC RX so parsing and forwarding do not block the UART side of the bridge.
+ */
 typedef struct {
     HardwareExerciserApp* app;
     HeBridgeMode mode;
@@ -79,6 +95,7 @@ typedef struct {
     uint8_t uart_rx_buf[CDC_DATA_SZ];
 } HeBridge;
 
+/* App-wide state shared between the two bridges and the simple status UI. */
 struct HardwareExerciserApp {
     Gui* gui;
     ViewPort* view_port;
@@ -96,6 +113,7 @@ typedef struct {
     InputEvent input;
 } HeAppEvent;
 
+/* Context used while upgrading a 14A scan into ISO14443-4A ATS collection. */
 typedef struct {
     FuriEventFlag* event;
     NfcPoller* poller;
@@ -108,6 +126,7 @@ typedef struct {
     size_t ats_len;
 } He14aScanContext;
 
+/* Context for one-shot 14A transceive requests driven by the HX protocol. */
 typedef struct {
     FuriEventFlag* event;
     NfcPoller* poller;
@@ -118,6 +137,7 @@ typedef struct {
     HxStatus status;
 } He14aTxRxContext;
 
+/* Context for one-shot ISO15693 inventory/system-info reads. */
 typedef struct {
     FuriEventFlag* event;
     NfcPoller* poller;
@@ -127,6 +147,7 @@ typedef struct {
     Iso15693_3SystemInfo info;
 } He15693ScanContext;
 
+/* Context for one-shot ISO15693 transceive requests with caller-supplied FWT. */
 typedef struct {
     FuriEventFlag* event;
     NfcPoller* poller;
@@ -138,11 +159,13 @@ typedef struct {
     HxStatus status;
 } He15693TxRxContext;
 
+/* LF worker callback only needs to return the detected protocol id and completion signal. */
 typedef struct {
     FuriEventFlag* event;
     ProtocolId protocol;
 } HeLfReadContext;
 
+/* Capability mask advertised by GetCaps. Keep this aligned with the dispatch table below. */
 static const uint32_t he_caps =
     HX_CAP_PING | HX_CAP_GET_CAPS | HX_CAP_GET_STATUS | HX_CAP_HF14A_SCAN | HX_CAP_HF14A_TXRX |
     HX_CAP_HF15693_SCAN | HX_CAP_HF15693_TXRX | HX_CAP_LF_READ_DECODED;
@@ -162,6 +185,7 @@ static const char* he_bridge_init_status_label(HeBridgeInitStatus status) {
 static void he_view_draw_callback(Canvas* canvas, void* context) {
     const HardwareExerciserApp* app = context;
 
+    /* The UI is intentionally tiny: it only confirms bridge role, connection state, and failures. */
     canvas_clear(canvas);
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 2, 10, "HardwareExerciser");
@@ -193,6 +217,7 @@ static void he_view_input_callback(InputEvent* input_event, void* context) {
 }
 
 static void he_bridge_release_tx_slot(HeBridge* bridge) {
+    /* CDC writes are single-flight; disconnect/reset paths may need to unblock a waiting sender. */
     if(furi_semaphore_get_count(bridge->tx_sem) == 0U) {
         furi_semaphore_release(bridge->tx_sem);
     }
@@ -204,6 +229,7 @@ static void he_bridge_reset_cdc_accum(HeBridge* bridge) {
 }
 
 static void he_bridge_reset_session(HeBridge* bridge) {
+    /* Drop partial host frames and stale UART bytes whenever the USB session is torn down. */
     he_bridge_reset_cdc_accum(bridge);
     if(bridge->rx_stream) {
         furi_check(furi_stream_buffer_reset(bridge->rx_stream) == FuriStatusOk);
@@ -232,6 +258,7 @@ static void he_bridge_on_uart_rx_dma(
     if(event & (FuriHalSerialRxEventData | FuriHalSerialRxEventIdle)) {
         uint8_t data[FURI_HAL_SERIAL_DMA_BUFFER_SIZE] = {0};
 
+        /* Drain all bytes the DMA engine reports before waking the bridge worker. */
         while(size > 0U) {
             const size_t request_size =
                 size > FURI_HAL_SERIAL_DMA_BUFFER_SIZE ? FURI_HAL_SERIAL_DMA_BUFFER_SIZE : size;
@@ -263,6 +290,7 @@ static void he_bridge_vcp_state(void* context, CdcState state) {
     HeBridge* bridge = context;
     bridge->cdc_connected = (state == CdcStateConnected);
     if(state == CdcStateDisconnected) {
+        /* A disappearing host must not leave partial frames or a blocked sender behind. */
         he_bridge_release_tx_slot(bridge);
         he_bridge_signal_worker(bridge, HeWorkerEvtSessionReset);
         he_bridge_signal_tx(bridge, HeWorkerEvtSessionReset);
@@ -294,10 +322,12 @@ static bool he_bridge_send_cdc(HeBridge* bridge, const uint8_t* data, size_t len
         return false;
     }
 
+    /* The Flipper CDC API is asynchronous; use a semaphore so only one transfer is in flight. */
     if(furi_semaphore_acquire(bridge->tx_sem, HE_WAIT_TIMEOUT_MS) != FuriStatusOk) {
         return false;
     }
 
+    /* Both bridges share the USB device, so guard callback registration and endpoint access. */
     furi_check(furi_mutex_acquire(bridge->usb_mutex, FuriWaitForever) == FuriStatusOk);
     furi_hal_cdc_send(bridge->vcp_ch, (uint8_t*)data, len);
     furi_check(furi_mutex_release(bridge->usb_mutex) == FuriStatusOk);
@@ -314,6 +344,7 @@ static bool he_bridge_forward_frame_to_uart(HeBridge* bridge, const uint8_t* dat
 }
 
 static void he_bridge_forward_uart_to_cdc(HeBridge* bridge) {
+    /* Keep draining UART RX until CDC backpressure or an empty stream says to stop. */
     while(bridge->cdc_connected) {
         const size_t len = furi_stream_buffer_receive(
             bridge->rx_stream, bridge->uart_rx_buf, sizeof(bridge->uart_rx_buf), 0U);
@@ -344,6 +375,7 @@ static size_t he_flatten_14a_ats(const Iso14443_4aData* iso4, uint8_t* out, size
         return 0U;
     }
 
+    /* Rebuild ATS bytes from the parsed SDK representation so the host sees a compact blob. */
     out[ats_len++] = iso4->ats_data.t0;
     if(iso4->ats_data.t0 & (1U << 4)) out[ats_len++] = iso4->ats_data.ta_1;
     if(iso4->ats_data.t0 & (1U << 5)) out[ats_len++] = iso4->ats_data.tb_1;
@@ -373,6 +405,7 @@ static NfcCommand he_14a_ats_callback(NfcGenericEvent event, void* context) {
     He14aScanContext* scan = context;
     const Iso14443_4aPollerEvent* iso_event = event.event_data;
 
+    /* The callback is only used to opportunistically collect ATS after a successful 14A scan. */
     if(event.protocol == NfcProtocolIso14443_4a && iso_event &&
        iso_event->type == Iso14443_4aPollerEventTypeReady) {
         const Iso14443_4aData* data = nfc_poller_get_data(scan->poller);
@@ -395,6 +428,7 @@ static NfcCommand he_14a_txrx_callback(NfcGenericEvent event, void* context) {
     BitBuffer* tx_buffer = NULL;
     BitBuffer* rx_buffer = NULL;
 
+    /* A ready event means the poller is active and a tag is present for a single exchange. */
     if(event.protocol != NfcProtocolIso14443_3a || !iso_event ||
        iso_event->type != Iso14443_3aPollerEventTypeReady) {
         txrx->status = HxStatusNotFound;
@@ -413,6 +447,7 @@ static NfcCommand he_14a_txrx_callback(NfcGenericEvent event, void* context) {
     const Iso14443_3aError error = iso14443_3a_poller_txrx(
         (Iso14443_3aPoller*)event.instance, tx_buffer, rx_buffer, ISO14443_3A_FDT_LISTEN_FC);
     if(error == Iso14443_3aErrorNone) {
+        /* Copy out of BitBuffer before freeing it so the synchronous caller owns the response. */
         txrx->rx_len = bit_buffer_get_size_bytes(rx_buffer);
         if(txrx->rx_len <= sizeof(txrx->rx_data)) {
             memcpy(txrx->rx_data, bit_buffer_get_data(rx_buffer), txrx->rx_len);
@@ -435,6 +470,7 @@ static NfcCommand he_15693_scan_callback(NfcGenericEvent event, void* context) {
     He15693ScanContext* scan = context;
     const Iso15693_3PollerEvent* iso_event = event.event_data;
 
+    /* ISO15693 scan piggybacks on the poller-ready callback to snapshot UID and system info. */
     if(event.protocol == NfcProtocolIso15693_3 && iso_event &&
        iso_event->type == Iso15693_3PollerEventTypeReady) {
         const Iso15693_3Data* data = nfc_poller_get_data(scan->poller);
@@ -458,6 +494,7 @@ static NfcCommand he_15693_txrx_callback(NfcGenericEvent event, void* context) {
     BitBuffer* tx_buffer = NULL;
     BitBuffer* rx_buffer = NULL;
 
+    /* The HX request already carries the raw frame, so only timing and copy-out happen here. */
     if(event.protocol != NfcProtocolIso15693_3 || !iso_event ||
        iso_event->type != Iso15693_3PollerEventTypeReady) {
         txrx->status = HxStatusNotFound;
@@ -501,11 +538,13 @@ static void he_lf_read_callback(LFRFIDWorkerReadResult result, ProtocolId proto,
     if(result == LFRFIDWorkerReadDone) {
         lf->protocol = proto;
     }
+    /* Signal the exact LF worker outcome so the synchronous caller can time out or continue. */
     furi_event_flag_set(lf->event, 1U << result);
 }
 
 static HxStatus
     he_handle_ping(const HxRequest* request, uint8_t* out, size_t out_cap, size_t* out_len) {
+    /* Ping is a transport sanity check, so it echoes the request body verbatim. */
     return hx_copy_response_body(request->body, request->body_len, out, out_cap, out_len) ?
                HxStatusOk :
                HxStatusInvalidRequest;
@@ -516,6 +555,7 @@ static HxStatus he_handle_get_caps(uint8_t* out, size_t out_cap, size_t* out_len
         *out_len = 0U;
         return HxStatusIoError;
     }
+    /* Capabilities are returned little-endian to match the protocol helper and host tooling. */
     out[0] = (uint8_t)(he_caps & 0xffU);
     out[1] = (uint8_t)((he_caps >> 8) & 0xffU);
     out[2] = (uint8_t)((he_caps >> 16) & 0xffU);
@@ -530,6 +570,7 @@ static HxStatus
         *out_len = 0U;
         return HxStatusIoError;
     }
+    /* Report host connection state separately from UART ownership so setup failures are visible. */
     out[0] = app->sam_bridge.cdc_connected ? 1U : 0U;
     out[1] = app->uhf_bridge.cdc_connected ? 1U : 0U;
     out[2] = app->sam_bridge.serial_handle ? 1U : 0U;
@@ -549,6 +590,7 @@ static HxStatus
     Iso14443_3aError iso3_error;
 
     UNUSED(app);
+    /* First do a synchronous 14A identify pass, then optionally re-enter as 4A to collect ATS. */
     nfc = nfc_alloc();
     if(!nfc) {
         goto cleanup;
@@ -585,6 +627,7 @@ static HxStatus
         const uint32_t flags = furi_event_flag_wait(event, 1U, FuriFlagWaitAny, HE_WAIT_TIMEOUT_MS);
         nfc_poller_stop(poller);
         if(flags == FuriFlagErrorTimeout) {
+            /* ATS is optional for scan success; timeout falls back to UID/ATQA/SAK only. */
             scan.ats_len = 0U;
         }
     }
@@ -620,6 +663,7 @@ static HxStatus
 
     UNUSED(app);
     if(request->body_len == 0U) {
+        /* The host must provide at least one raw frame byte to transmit. */
         return HxStatusInvalidRequest;
     }
 
@@ -639,6 +683,7 @@ static HxStatus
     txrx.tx_data = request->body;
     txrx.tx_len = request->body_len;
     txrx.status = HxStatusNotFound;
+    /* The callback executes exactly one exchange and signals completion back through event flags. */
     nfc_poller_start(poller, he_14a_txrx_callback, &txrx);
     const uint32_t flags = furi_event_flag_wait(event, 1U, FuriFlagWaitAny, HE_WAIT_TIMEOUT_MS);
     nfc_poller_stop(poller);
@@ -684,6 +729,7 @@ static HxStatus
 
     scan.event = event;
     scan.poller = poller;
+    /* The poller callback snapshots the discovered tag and system-info fields into scan. */
     nfc_poller_start(poller, he_15693_scan_callback, &scan);
     const uint32_t flags = furi_event_flag_wait(event, 1U, FuriFlagWaitAny, HE_WAIT_TIMEOUT_MS);
     nfc_poller_stop(poller);
@@ -733,6 +779,7 @@ static HxStatus
 
     UNUSED(app);
     if(request->body_len < 5U) {
+        /* Body is encoded as fwt_fc_le32 followed by at least one outbound frame byte. */
         return HxStatusInvalidRequest;
     }
 
@@ -798,6 +845,7 @@ static HxStatus
     context.event = event;
     context.protocol = PROTOCOL_NO;
     lfrfid_worker_start_thread(worker);
+    /* LF decode runs asynchronously and returns the matched protocol plus rendered protocol data. */
     lfrfid_worker_read_start(worker, LFRFIDWorkerReadTypeAuto, he_lf_read_callback, &context);
     const uint32_t flags =
         furi_event_flag_wait(event, 1U << LFRFIDWorkerReadDone, FuriFlagWaitAny, HE_WAIT_TIMEOUT_MS);
@@ -838,6 +886,7 @@ static HxStatus
     out[1] = (uint8_t)name_len;
     out[2] = (uint8_t)data_len;
     out[3] = (uint8_t)rendered_len;
+    /* Pack name, binary data, and rendered text into one self-describing response blob. */
     memcpy(out + 4U, name, name_len);
     memcpy(out + 4U + name_len, protocol_data, data_len);
     memcpy(out + 4U + name_len + data_len, rendered_text, rendered_len);
@@ -861,6 +910,7 @@ static HxStatus he_dispatch_request(
     size_t* out_len) {
     *out_len = 0U;
 
+    /* Cheap metadata opcodes bypass the hardware mutex so they are always available. */
     if(request->opcode == HxOpcodePing) {
         return he_handle_ping(request, out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeGetCaps) {
@@ -872,6 +922,7 @@ static HxStatus he_dispatch_request(
     }
 
     if(furi_mutex_acquire(app->hw_mutex, 0U) != FuriStatusOk) {
+        /* Hardware-facing opcodes are intentionally single-flight across both bridges. */
         return HxStatusBusy;
     }
 
@@ -908,6 +959,7 @@ static bool he_bridge_handle_escape_frame(HeBridge* bridge, const uint8_t* frame
         opcode = payload[3];
     }
 
+    /* Malformed frames still get a structured response when the opcode byte can be recovered. */
     if(!hx_validate_lrc(frame, frame_len) || !hx_parse_request_payload(payload, payload_len, &request)) {
         status = HxStatusInvalidRequest;
     } else {
@@ -919,6 +971,7 @@ static bool he_bridge_handle_escape_frame(HeBridge* bridge, const uint8_t* frame
     size_t payload_size = hx_build_response_payload(
         opcode, status, response_body, response_body_len, response_payload, sizeof(response_payload));
     if(payload_size == 0U) {
+        /* If response assembly fails, fall back to a minimal IoError envelope. */
         response_body_len = 0U;
         payload_size = hx_build_response_payload(
             opcode, HxStatusIoError, NULL, 0U, response_payload, sizeof(response_payload));
@@ -940,6 +993,7 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
     while(1) {
         size_t received = 0U;
 
+        /* Pull as much host data as is currently available into the accumulation buffer. */
         while(bridge->cdc_accum_len < sizeof(bridge->cdc_accum)) {
             const size_t remaining = sizeof(bridge->cdc_accum) - bridge->cdc_accum_len;
             const size_t request_size = remaining > CDC_DATA_SZ ? CDC_DATA_SZ : remaining;
@@ -963,6 +1017,7 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
 
         if(bridge->mode == HeBridgeModeUhfRaw) {
             if(bridge->cdc_accum_len > 0U) {
+                /* CDC1 never parses frames; every byte goes straight to the UHF UART. */
                 he_bridge_forward_frame_to_uart(bridge, bridge->cdc_accum, bridge->cdc_accum_len);
                 bridge->cdc_accum_len = 0U;
             }
@@ -980,6 +1035,7 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
                     &frame_len);
 
             if(state == HxFrameStateDesync || state == HxFrameStateInvalidLength) {
+                /* Resynchronize one byte at a time until the framing preamble is found again. */
                 memmove(bridge->cdc_accum, bridge->cdc_accum + 1U, bridge->cdc_accum_len - 1U);
                 bridge->cdc_accum_len--;
                 continue;
@@ -987,6 +1043,7 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
 
             if(state == HxFrameStateNeedMore) {
                 if(bridge->cdc_accum_len == sizeof(bridge->cdc_accum)) {
+                    /* Full buffer with no complete frame means the oldest byte cannot be trusted. */
                     memmove(bridge->cdc_accum, bridge->cdc_accum + 1U, bridge->cdc_accum_len - 1U);
                     bridge->cdc_accum_len--;
                     continue;
@@ -995,8 +1052,10 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
             }
 
             if(hx_ccid_is_escape_frame(bridge->cdc_accum, frame_len)) {
+                /* Escape frames terminate locally and become HX protocol operations. */
                 he_bridge_handle_escape_frame(bridge, bridge->cdc_accum, frame_len);
             } else {
+                /* Ordinary CCID traffic is transparent and continues to the SAM UART. */
                 he_bridge_forward_frame_to_uart(bridge, bridge->cdc_accum, frame_len);
             }
 
@@ -1014,6 +1073,7 @@ static int32_t he_bridge_tx_thread(void* context) {
     HeBridge* bridge = context;
     bridge->tx_thread_id = furi_thread_get_current_id();
 
+    /* This thread exists solely to react to host RX callbacks without blocking the worker thread. */
     while(1) {
         const uint32_t events =
             furi_thread_flags_wait(HE_WORKER_TX_EVENTS, FuriFlagWaitAny, FuriWaitForever);
@@ -1053,6 +1113,7 @@ static int32_t he_bridge_worker(void* context) {
         goto init_failed;
     }
 
+    /* The UART side must be live before CDC callbacks are installed and allowed to enqueue work. */
     furi_hal_serial_init(bridge->serial_handle, HE_BAUDRATE);
     furi_thread_start(bridge->tx_thread);
     furi_hal_serial_dma_rx_start(bridge->serial_handle, he_bridge_on_uart_rx_dma, bridge, false);
@@ -1075,10 +1136,12 @@ static int32_t he_bridge_worker(void* context) {
         }
 
         if(events & (HeWorkerEvtRxDone | HeWorkerEvtCdcTxComplete)) {
+            /* New UART bytes or a completed USB transfer both unblock more UART->CDC forwarding. */
             he_bridge_forward_uart_to_cdc(bridge);
         }
     }
 
+    /* Teardown order matters: stop callbacks and TX thread before releasing UART resources. */
     if(bridge->cdc_callbacks_registered) {
         furi_hal_cdc_set_callbacks(bridge->vcp_ch, NULL, NULL);
         bridge->cdc_callbacks_registered = false;
@@ -1109,6 +1172,7 @@ static int32_t he_bridge_worker(void* context) {
     return 0;
 
 init_failed:
+    /* Mirror the normal cleanup path so partial startup cannot leak callbacks or UART ownership. */
     if(bridge->cdc_callbacks_registered) {
         furi_hal_cdc_set_callbacks(bridge->vcp_ch, NULL, NULL);
         bridge->cdc_callbacks_registered = false;
@@ -1153,6 +1217,7 @@ static bool he_bridge_start(HeBridge* bridge) {
     }
     furi_thread_set_priority(bridge->thread, FuriThreadPriorityHigh);
     furi_thread_start(bridge->thread);
+    /* Startup is synchronous from the app's perspective: wait for the worker to report readiness. */
     furi_event_flag_wait(
         bridge->init_event, HE_BRIDGE_INIT_READY_FLAG, FuriFlagWaitAny, FuriWaitForever);
     furi_event_flag_free(bridge->init_event);
@@ -1203,12 +1268,14 @@ static HardwareExerciserApp* he_app_alloc(void) {
     view_port_input_callback_set(app->view_port, he_view_input_callback, app->event_queue);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
 
+    /* CDC0 fronts the SAM path and handles local escape requests. */
     app->sam_bridge.app = app;
     app->sam_bridge.mode = HeBridgeModeSamEscape;
     app->sam_bridge.vcp_ch = 0U;
     app->sam_bridge.uart_ch = FuriHalSerialIdLpuart;
     app->sam_bridge.usb_mutex = app->usb_mutex;
 
+    /* CDC1 is intentionally simpler: it is a raw host-to-UHF serial bridge. */
     app->uhf_bridge.app = app;
     app->uhf_bridge.mode = HeBridgeModeUhfRaw;
     app->uhf_bridge.vcp_ch = 1U;
@@ -1238,11 +1305,13 @@ int32_t hardware_exerciser_app(void* p) {
     app->usb_prev = furi_hal_usb_get_config();
     furi_hal_usb_unlock();
     cli_vcp_disable(app->cli_vcp);
+    /* Switch the device into dual CDC mode so both bridges are available to the host at once. */
     furi_check(furi_hal_usb_set_config(&usb_cdc_dual, NULL) == true);
 
     const bool sam_started = he_bridge_start(&app->sam_bridge);
     const bool uhf_started = he_bridge_start(&app->uhf_bridge);
     if(!sam_started || !uhf_started) {
+        /* Fall back to a status screen instead of exiting immediately so startup errors are visible. */
         he_bridge_stop(&app->uhf_bridge);
         he_bridge_stop(&app->sam_bridge);
         furi_hal_usb_set_config(app->usb_prev, NULL);
@@ -1261,6 +1330,7 @@ int32_t hardware_exerciser_app(void* p) {
     }
 
     if(!app->startup_failed) {
+        /* Restore the original USB configuration and CLI only after both bridges are stopped. */
         he_bridge_stop(&app->uhf_bridge);
         he_bridge_stop(&app->sam_bridge);
         furi_hal_usb_set_config(app->usb_prev, NULL);

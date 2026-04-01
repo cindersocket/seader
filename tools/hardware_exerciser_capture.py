@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Minimal host-side probe for the Hardware Exerciser CDC0 escape protocol."""
+
 import argparse
 import struct
 import sys
@@ -17,6 +19,7 @@ HX_VERSION = 1
 
 
 def lrc(data: bytes) -> int:
+    """Return the XOR LRC used by Hardware Exerciser request and response frames."""
     value = 0
     for b in data:
         value ^= b
@@ -24,7 +27,9 @@ def lrc(data: bytes) -> int:
 
 
 def build_escape_frame(seq: int, opcode: int, body: bytes = b"", slot: int = 0) -> bytes:
+    """Build one PC_TO_RDR_ESCAPE frame carrying an HX request payload."""
     payload = b"HX" + bytes([HX_VERSION, opcode]) + body
+    # The frame layout mirrors the firmware helper: preamble, CCID header, HX payload, trailing LRC.
     header = bytearray(
         [
             SYNC,
@@ -46,10 +51,12 @@ def build_escape_frame(seq: int, opcode: int, body: bytes = b"", slot: int = 0) 
 
 
 def read_frame(port: serial.Serial) -> bytes:
+    """Read a complete response frame using the CCID payload length from the 12-byte wire header."""
     header = port.read(12)
     if len(header) < 12:
         raise TimeoutError("timed out waiting for response header")
     payload_len = struct.unpack("<I", header[3:7])[0]
+    # One extra byte is read for the trailing LRC appended after the payload.
     payload = port.read(payload_len + 1)
     if len(payload) < payload_len + 1:
         raise TimeoutError("timed out waiting for response payload")
@@ -64,7 +71,7 @@ def main() -> int:
     parser.add_argument(
         "--body-hex",
         default="",
-        help="Raw request body bytes. HF14A_TXRX expects raw ISO14443A frame bytes.",
+        help="Raw HX request body bytes. HF14A_TXRX expects raw ISO14443A frame bytes.",
     )
     args = parser.parse_args()
 
@@ -72,11 +79,12 @@ def main() -> int:
     frame = build_escape_frame(args.seq, args.opcode, body)
 
     with serial.Serial(args.port, 115200, timeout=1.0) as port:
+        # The helper is intentionally single-shot so it can be used in shell loops or manual probing.
         port.write(frame)
         response = read_frame(port)
 
     print(
-        "# HF14A_SCAN response: uid_len | uid | atqa_lo | atqa_hi | sak | ats_len | ats",
+        "# Raw response frame as hex. HF14A_SCAN body is: uid_len | uid | atqa_lo | atqa_hi | sak | ats_len | ats",
         file=sys.stderr,
     )
     print(response.hex())

@@ -2,9 +2,11 @@
 
 #include <string.h>
 
+/* CCID uses a fixed 10-byte header; the wire format adds 2 bytes of framing in front of it. */
 #define HX_CCID_HEADER_LEN 10U
 #define HX_WIRE_HEADER_LEN (2U + HX_CCID_HEADER_LEN)
 
+/* CCID length fields are encoded little-endian in bytes 3..6 of the on-wire frame. */
 static uint32_t hx_read_le32(const uint8_t* data) {
     return ((uint32_t)data[0]) | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
            ((uint32_t)data[3] << 24);
@@ -13,6 +15,7 @@ static uint32_t hx_read_le32(const uint8_t* data) {
 uint8_t hx_calc_lrc(const uint8_t* data, size_t len) {
     uint8_t lrc = 0U;
 
+    /* The transport uses a simple XOR LRC so the same routine works for requests and responses. */
     for(size_t i = 0; i < len; i++) {
         lrc ^= data[i];
     }
@@ -44,6 +47,7 @@ HxFrameState
     }
 
     if(data[0] != HX_SYNC || data[1] != HX_CTRL) {
+        /* The caller can discard a byte and keep scanning for the framing preamble. */
         return HxFrameStateDesync;
     }
 
@@ -51,8 +55,10 @@ HxFrameState
         return HxFrameStateNeedMore;
     }
 
+    /* The CCID payload length does not include the wire preamble or final LRC byte. */
     const uint32_t payload_len = hx_read_le32(&data[3]);
     if((size_t)payload_len > SIZE_MAX - (HX_WIRE_HEADER_LEN + 1U)) {
+        /* Guard against size_t overflow before building the full frame length. */
         return HxFrameStateInvalidLength;
     }
 
@@ -81,6 +87,7 @@ bool hx_ccid_is_escape_frame(const uint8_t* frame, size_t frame_len) {
         return false;
     }
 
+    /* Only escape frames are consumed locally; other CCID traffic is forwarded to the SAM UART. */
     return frame[2] == HX_CCID_PC_TO_RDR_ESCAPE;
 }
 
@@ -95,6 +102,7 @@ bool hx_parse_request_payload(const uint8_t* payload, size_t payload_len, HxRequ
     }
 
     request->opcode = payload[3];
+    /* The body points into the caller-owned payload buffer and is never copied here. */
     request->body = payload + 4U;
     request->body_len = payload_len - 4U;
     return true;
@@ -140,6 +148,7 @@ size_t hx_build_hf14a_scan_payload(
         return 0U;
     }
 
+    /* The host expects a compact self-describing blob rather than a packed C struct. */
     out[0] = (uint8_t)uid_len;
     memcpy(out + 1U, uid, uid_len);
     out[1U + uid_len] = atqa[0];
@@ -169,6 +178,7 @@ size_t hx_build_response_payload(
         return 0U;
     }
 
+    /* Response payloads intentionally mirror the request header with an added status byte. */
     out[0] = HX_REQUEST_MAGIC_0;
     out[1] = HX_REQUEST_MAGIC_1;
     out[2] = HX_PROTOCOL_VERSION;
@@ -216,6 +226,7 @@ size_t hx_build_ccid_escape_response(
     out[4] = (uint8_t)((payload_len >> 8) & 0xffU);
     out[5] = (uint8_t)((payload_len >> 16) & 0xffU);
     out[6] = (uint8_t)((payload_len >> 24) & 0xffU);
+    /* Preserve host-visible correlation fields from the request. */
     out[7] = request_frame[7];
     out[8] = request_frame[8];
     out[9] = 0U;
