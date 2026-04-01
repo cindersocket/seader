@@ -1,6 +1,9 @@
+#include "gpio.h"
+#include "log.h"
 #include "protocol.h"
 
 #include <cli/cli_vcp.h>
+#include <expansion/expansion.h>
 #include <furi.h>
 #include <furi_hal.h>
 #include <furi_hal_usb_cdc.h>
@@ -39,6 +42,8 @@
 #define HE_ESCAPE_BODY_MAX 512U
 #define HE_WAIT_TIMEOUT_MS 1000U
 #define HE_14A_ATS_MAX 64U
+#define HE_BRIDGE_INIT_TIMEOUT_MS 2000U
+#define HE_DIAG_CAPACITY 128U
 
 /* Cross-thread events shared by the per-bridge worker thread and its CDC RX helper thread. */
 typedef enum {
@@ -60,12 +65,53 @@ typedef enum {
 } HeBridgeMode;
 
 typedef enum {
+    HeBridgeLifecycleStopped = 0,
+    HeBridgeLifecycleStarting,
+    HeBridgeLifecycleRunning,
+    HeBridgeLifecycleStopping,
+} HeBridgeLifecycle;
+
+typedef enum {
     HeBridgeInitStatusOk = 0,
     HeBridgeInitStatusAllocFailed,
     HeBridgeInitStatusSerialBusy,
 } HeBridgeInitStatus;
 
 typedef struct HardwareExerciserApp HardwareExerciserApp;
+
+typedef enum {
+    HeDiagVcpRxCallback = 1,
+    HeDiagVcpStateCallback,
+    HeDiagUsbLockFailed,
+    HeDiagUsbUnlockFailed,
+    HeDiagUsbConfigBegin,
+    HeDiagUsbConfigEnd,
+    HeDiagCdcCallbacksBegin,
+    HeDiagCdcCallbacksEnd,
+    HeDiagSerialRxStartBegin,
+    HeDiagSerialRxStartEnd,
+    HeDiagSerialRxStopBegin,
+    HeDiagSerialRxStopEnd,
+    HeDiagSerialRelease,
+    HeDiagCdcReceive,
+    HeDiagCdcReceiveError,
+    HeDiagCdcSend,
+    HeDiagCdcSendSkipped,
+    HeDiagFrameState,
+    HeDiagEscapeDispatch,
+    HeDiagNonEscapeForward,
+    HeDiagSessionResetFailed,
+    HeDiagSessionResetDrain,
+    HeDiagCallbackIgnored,
+} HeDiagCode;
+
+typedef struct {
+    uint32_t seq;
+    uint8_t vcp;
+    uint8_t code;
+    int32_t a;
+    int32_t b;
+} HeDiagEvent;
 
 /*
  * Per-bridge runtime state.
@@ -86,10 +132,13 @@ typedef struct {
     FuriSemaphore* tx_sem;
     FuriMutex* usb_mutex;
     FuriHalSerialHandle* serial_handle;
+    bool serial_rx_started;
+    bool serial_rx_dma;
     bool cdc_connected;
     bool cdc_callbacks_registered;
     FuriEventFlag* init_event;
     HeBridgeInitStatus init_status;
+    HeBridgeLifecycle lifecycle;
     uint8_t cdc_accum[HE_CDC_ACC_BUF_SIZE];
     size_t cdc_accum_len;
     uint8_t uart_rx_buf[CDC_DATA_SZ];
@@ -101,10 +150,20 @@ struct HardwareExerciserApp {
     ViewPort* view_port;
     FuriMessageQueue* event_queue;
     CliVcp* cli_vcp;
+    Expansion* expansion;
     FuriHalUsbInterface* usb_prev;
     FuriMutex* hw_mutex;
     FuriMutex* usb_mutex;
+    bool expansion_disabled;
+    bool exit_requested;
+    bool ui_dirty;
     bool startup_failed;
+    HeDiagEvent diag[HE_DIAG_CAPACITY];
+    uint16_t diag_read;
+    uint16_t diag_write;
+    uint32_t diag_seq;
+    uint32_t diag_dropped;
+    HeGpioState gpio;
     HeBridge sam_bridge;
     HeBridge uhf_bridge;
 };
@@ -168,7 +227,9 @@ typedef struct {
 /* Capability mask advertised by GetCaps. Keep this aligned with the dispatch table below. */
 static const uint32_t he_caps =
     HX_CAP_PING | HX_CAP_GET_CAPS | HX_CAP_GET_STATUS | HX_CAP_HF14A_SCAN | HX_CAP_HF14A_TXRX |
-    HX_CAP_HF15693_SCAN | HX_CAP_HF15693_TXRX | HX_CAP_LF_READ_DECODED;
+    HX_CAP_HF15693_SCAN | HX_CAP_HF15693_TXRX | HX_CAP_LF_READ_DECODED |
+    HX_CAP_GPIO_LIST_PINS | HX_CAP_GPIO_CONFIGURE | HX_CAP_GPIO_WRITE | HX_CAP_GPIO_READ |
+    HX_CAP_GPIO_READ_ANALOG | HX_CAP_GPIO_VECTOR | HX_CAP_GPIO_RESET | HX_CAP_QUIT;
 
 #define HE_BRIDGE_INIT_READY_FLAG (1U << 0)
 
@@ -180,6 +241,177 @@ static const char* he_bridge_init_status_label(HeBridgeInitStatus status) {
     }
 
     return "ready";
+}
+
+static const char* he_thread_state_label(FuriThreadState state) {
+    switch(state) {
+    case FuriThreadStateStopped:
+        return "stopped";
+    case FuriThreadStateStopping:
+        return "stopping";
+    case FuriThreadStateStarting:
+        return "starting";
+    case FuriThreadStateRunning:
+        return "running";
+    default:
+        return "unknown";
+    }
+}
+
+static const char* he_diag_code_label(HeDiagCode code) {
+    switch(code) {
+    case HeDiagVcpRxCallback:
+        return "vcp_rx_cb";
+    case HeDiagVcpStateCallback:
+        return "vcp_state_cb";
+    case HeDiagUsbLockFailed:
+        return "usb_lock_failed";
+    case HeDiagUsbUnlockFailed:
+        return "usb_unlock_failed";
+    case HeDiagUsbConfigBegin:
+        return "usb_cfg_begin";
+    case HeDiagUsbConfigEnd:
+        return "usb_cfg_end";
+    case HeDiagCdcCallbacksBegin:
+        return "cdc_cb_begin";
+    case HeDiagCdcCallbacksEnd:
+        return "cdc_cb_end";
+    case HeDiagSerialRxStartBegin:
+        return "serial_rx_start_begin";
+    case HeDiagSerialRxStartEnd:
+        return "serial_rx_start_end";
+    case HeDiagSerialRxStopBegin:
+        return "serial_rx_stop_begin";
+    case HeDiagSerialRxStopEnd:
+        return "serial_rx_stop_end";
+    case HeDiagSerialRelease:
+        return "serial_release";
+    case HeDiagCdcReceive:
+        return "cdc_recv";
+    case HeDiagCdcReceiveError:
+        return "cdc_recv_err";
+    case HeDiagCdcSend:
+        return "cdc_send";
+    case HeDiagCdcSendSkipped:
+        return "cdc_send_skip";
+    case HeDiagFrameState:
+        return "frame_state";
+    case HeDiagEscapeDispatch:
+        return "escape_dispatch";
+    case HeDiagNonEscapeForward:
+        return "non_escape_fwd";
+    case HeDiagSessionResetFailed:
+        return "session_reset_failed";
+    case HeDiagSessionResetDrain:
+        return "session_reset_drain";
+    case HeDiagCallbackIgnored:
+        return "cb_ignored";
+    default:
+        return "unknown";
+    }
+}
+
+static void he_diag_record(HardwareExerciserApp* app, uint8_t vcp, HeDiagCode code, int32_t a, int32_t b) {
+    if(!app) {
+        return;
+    }
+
+    FURI_CRITICAL_ENTER();
+    const uint16_t next = (uint16_t)((app->diag_write + 1U) % HE_DIAG_CAPACITY);
+    if(next == app->diag_read) {
+        app->diag_dropped++;
+    } else {
+        HeDiagEvent* event = &app->diag[app->diag_write];
+        event->seq = ++app->diag_seq;
+        event->vcp = vcp;
+        event->code = (uint8_t)code;
+        event->a = a;
+        event->b = b;
+        app->diag_write = next;
+    }
+    FURI_CRITICAL_EXIT();
+}
+
+static void he_diag_flush(HardwareExerciserApp* app) {
+    if(!app) {
+        return;
+    }
+
+    while(true) {
+        HeDiagEvent event = {0};
+        uint32_t dropped = 0U;
+        bool has_event = false;
+
+        FURI_CRITICAL_ENTER();
+        dropped = app->diag_dropped;
+        app->diag_dropped = 0U;
+        if(app->diag_read != app->diag_write) {
+            event = app->diag[app->diag_read];
+            app->diag_read = (uint16_t)((app->diag_read + 1U) % HE_DIAG_CAPACITY);
+            has_event = true;
+        }
+        FURI_CRITICAL_EXIT();
+
+        if(dropped > 0U) {
+            he_log_tag("HEDiag", "dropped=%lu", (unsigned long)dropped);
+        }
+        if(!has_event) {
+            break;
+        }
+
+        he_log_tag(
+            "HEDiag",
+            "seq=%lu vcp=%u code=%s a=%ld b=%ld",
+            (unsigned long)event.seq,
+            event.vcp,
+            he_diag_code_label((HeDiagCode)event.code),
+            (long)event.a,
+            (long)event.b);
+    }
+}
+
+static bool he_bridge_is_running(const HeBridge* bridge) {
+    return bridge && bridge->lifecycle == HeBridgeLifecycleRunning;
+}
+
+static bool he_usb_lock(HeBridge* bridge) {
+    if(!bridge || !bridge->usb_mutex) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagUsbLockFailed, -99, 0);
+        return false;
+    }
+
+    const FuriStatus status = furi_mutex_acquire(bridge->usb_mutex, HE_WAIT_TIMEOUT_MS);
+    if(status != FuriStatusOk) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagUsbLockFailed, status, bridge->lifecycle);
+        return false;
+    }
+
+    return true;
+}
+
+static bool he_usb_unlock(HeBridge* bridge) {
+    if(!bridge || !bridge->usb_mutex) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagUsbUnlockFailed, -99, 0);
+        return false;
+    }
+
+    const FuriStatus status = furi_mutex_release(bridge->usb_mutex);
+    if(status != FuriStatusOk) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagUsbUnlockFailed, status, bridge->lifecycle);
+        return false;
+    }
+
+    return true;
+}
+
+static void he_bridge_thread_state_callback(FuriThread* thread, FuriThreadState state, void* context) {
+    const HeBridge* bridge = context;
+    he_log_tag(
+        "HEBridge",
+        "thread state vcp=%u thread=%p state=%s",
+        bridge ? bridge->vcp_ch : 255U,
+        thread,
+        he_thread_state_label(state));
 }
 
 static void he_view_draw_callback(Canvas* canvas, void* context) {
@@ -228,11 +460,32 @@ static void he_bridge_reset_cdc_accum(HeBridge* bridge) {
     memset(bridge->cdc_accum, 0, sizeof(bridge->cdc_accum));
 }
 
+static void he_bridge_drain_rx_stream(HeBridge* bridge) {
+    if(!bridge || !bridge->rx_stream) {
+        return;
+    }
+
+    uint8_t discard[CDC_DATA_SZ];
+    size_t total = 0U;
+    while(true) {
+        const size_t len =
+            furi_stream_buffer_receive(bridge->rx_stream, discard, sizeof(discard), 0U);
+        if(len == 0U) {
+            break;
+        }
+        total += len;
+    }
+
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSessionResetDrain, total, bridge->lifecycle);
+}
+
 static void he_bridge_reset_session(HeBridge* bridge) {
     /* Drop partial host frames and stale UART bytes whenever the USB session is torn down. */
+    he_log_tag("HEBridge", "session reset mode=%u vcp=%u", bridge->mode, bridge->vcp_ch);
     he_bridge_reset_cdc_accum(bridge);
-    if(bridge->rx_stream) {
-        furi_check(furi_stream_buffer_reset(bridge->rx_stream) == FuriStatusOk);
+    he_bridge_drain_rx_stream(bridge);
+    if(bridge->mode == HeBridgeModeSamEscape) {
+        he_gpio_reset_all(&bridge->app->gpio);
     }
 }
 
@@ -275,19 +528,54 @@ static void he_bridge_on_uart_rx_dma(
     }
 }
 
+static void he_bridge_on_uart_rx_async(
+    FuriHalSerialHandle* handle,
+    FuriHalSerialRxEvent event,
+    void* context) {
+    HeBridge* bridge = context;
+
+    if(!(event & FuriHalSerialRxEventData)) {
+        return;
+    }
+
+    uint8_t data[FURI_HAL_SERIAL_DMA_BUFFER_SIZE] = {0};
+    size_t used = 0U;
+    while(used < sizeof(data) && furi_hal_serial_async_rx_available(handle)) {
+        data[used++] = furi_hal_serial_async_rx(handle);
+    }
+
+    if(used > 0U) {
+        furi_stream_buffer_send(bridge->rx_stream, data, used, 0U);
+        he_bridge_signal_worker(bridge, HeWorkerEvtRxDone);
+    }
+}
+
 static void he_bridge_vcp_tx_complete(void* context) {
     HeBridge* bridge = context;
+    if(!he_bridge_is_running(bridge)) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 1, bridge ? bridge->lifecycle : 0);
+        return;
+    }
     he_bridge_release_tx_slot(bridge);
     he_bridge_signal_worker(bridge, HeWorkerEvtCdcTxComplete);
 }
 
 static void he_bridge_vcp_rx(void* context) {
     HeBridge* bridge = context;
+    if(!he_bridge_is_running(bridge)) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 2, bridge ? bridge->lifecycle : 0);
+        return;
+    }
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagVcpRxCallback, bridge->cdc_accum_len, bridge->lifecycle);
     he_bridge_signal_tx(bridge, HeWorkerEvtCdcRx);
 }
 
 static void he_bridge_vcp_state(void* context, CdcState state) {
     HeBridge* bridge = context;
+    if(!bridge) {
+        return;
+    }
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagVcpStateCallback, state, bridge->lifecycle);
     bridge->cdc_connected = (state == CdcStateConnected);
     if(state == CdcStateDisconnected) {
         /* A disappearing host must not leave partial frames or a blocked sender behind. */
@@ -295,7 +583,7 @@ static void he_bridge_vcp_state(void* context, CdcState state) {
         he_bridge_signal_worker(bridge, HeWorkerEvtSessionReset);
         he_bridge_signal_tx(bridge, HeWorkerEvtSessionReset);
     }
-    view_port_update(bridge->app->view_port);
+    bridge->app->ui_dirty = true;
     he_bridge_signal_worker(bridge, HeWorkerEvtCdcTxComplete);
 }
 
@@ -318,7 +606,13 @@ static const CdcCallbacks he_bridge_cdc_callbacks = {
 };
 
 static bool he_bridge_send_cdc(HeBridge* bridge, const uint8_t* data, size_t len) {
-    if(!bridge->cdc_connected || len == 0U) {
+    if(!he_bridge_is_running(bridge) || !bridge->cdc_connected || len == 0U) {
+        he_diag_record(
+            bridge ? bridge->app : NULL,
+            bridge ? bridge->vcp_ch : 0xffU,
+            HeDiagCdcSendSkipped,
+            len,
+            bridge ? bridge->lifecycle : 0);
         return false;
     }
 
@@ -328,9 +622,14 @@ static bool he_bridge_send_cdc(HeBridge* bridge, const uint8_t* data, size_t len
     }
 
     /* Both bridges share the USB device, so guard callback registration and endpoint access. */
-    furi_check(furi_mutex_acquire(bridge->usb_mutex, FuriWaitForever) == FuriStatusOk);
+    if(!he_usb_lock(bridge)) {
+        return false;
+    }
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcSend, len, 0);
     furi_hal_cdc_send(bridge->vcp_ch, (uint8_t*)data, len);
-    furi_check(furi_mutex_release(bridge->usb_mutex) == FuriStatusOk);
+    if(!he_usb_unlock(bridge)) {
+        return false;
+    }
     return true;
 }
 
@@ -340,6 +639,7 @@ static bool he_bridge_forward_frame_to_uart(HeBridge* bridge, const uint8_t* dat
     }
 
     furi_hal_serial_tx(bridge->serial_handle, data, len);
+    he_log_tag("HEBridge", "forward uart ch=%u len=%u", bridge->uart_ch, (unsigned)len);
     return true;
 }
 
@@ -576,6 +876,82 @@ static HxStatus
     out[2] = app->sam_bridge.serial_handle ? 1U : 0U;
     out[3] = app->uhf_bridge.serial_handle ? 1U : 0U;
     *out_len = 4U;
+    return HxStatusOk;
+}
+
+static HxStatus
+    he_handle_gpio_list_pins(HardwareExerciserApp* app, uint8_t* out, size_t out_cap, size_t* out_len) {
+    if(out_len) {
+        *out_len = 0U;
+    }
+    return he_gpio_list_pins(&app->gpio, out, out_cap, out_len);
+}
+
+static HxStatus he_handle_gpio_configure(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    return he_gpio_configure(&app->gpio, request, out, out_cap, out_len);
+}
+
+static HxStatus he_handle_gpio_write(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    return he_gpio_write(&app->gpio, request, out, out_cap, out_len);
+}
+
+static HxStatus he_handle_gpio_read(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    return he_gpio_read(&app->gpio, request, out, out_cap, out_len);
+}
+
+static HxStatus he_handle_gpio_read_analog(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    return he_gpio_read_analog(&app->gpio, request, out, out_cap, out_len);
+}
+
+static HxStatus he_handle_gpio_vector_capture(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    return he_gpio_vector_capture(&app->gpio, request, out, out_cap, out_len);
+}
+
+static HxStatus
+    he_handle_gpio_reset(HardwareExerciserApp* app, uint8_t* out, size_t out_cap, size_t* out_len) {
+    UNUSED(out);
+    UNUSED(out_cap);
+    if(out_len) {
+        *out_len = 0U;
+    }
+    he_gpio_reset_all(&app->gpio);
+    return HxStatusOk;
+}
+
+static HxStatus
+    he_handle_quit(HardwareExerciserApp* app, const HxRequest* request, size_t* out_len) {
+    if(!app || !request || request->body_len != 0U || !out_len) {
+        return HxStatusInvalidRequest;
+    }
+
+    app->exit_requested = true;
+    *out_len = 0U;
+    he_log("quit requested over hx protocol");
     return HxStatusOk;
 }
 
@@ -917,6 +1293,13 @@ static HxStatus he_dispatch_request(
         return he_handle_get_caps(out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeGetStatus) {
         return he_handle_get_status(app, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioListPins) {
+        if(request->body_len != 0U) {
+            return HxStatusInvalidRequest;
+        }
+        return he_handle_gpio_list_pins(app, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeQuit) {
+        return he_handle_quit(app, request, out_len);
     } else if(request->opcode == HxOpcodeAbort) {
         return HxStatusOk;
     }
@@ -937,6 +1320,19 @@ static HxStatus he_dispatch_request(
         status = he_handle_hf15693_txrx(app, request, out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeLfReadDecoded) {
         status = he_handle_lf_read_decoded(app, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioConfigure) {
+        status = he_handle_gpio_configure(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioWrite) {
+        status = he_handle_gpio_write(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioRead) {
+        status = he_handle_gpio_read(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioReadAnalog) {
+        status = he_handle_gpio_read_analog(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioVectorCapture) {
+        status = he_handle_gpio_vector_capture(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGpioReset) {
+        status = request->body_len == 0U ? he_handle_gpio_reset(app, out, out_cap, out_len) :
+                                           HxStatusInvalidRequest;
     }
 
     furi_mutex_release(app->hw_mutex);
@@ -958,6 +1354,8 @@ static bool he_bridge_handle_escape_frame(HeBridge* bridge, const uint8_t* frame
     if(payload_len >= 4U) {
         opcode = payload[3];
     }
+    he_log_tag(
+        "HEBridge", "escape frame vcp=%u frame_len=%u opcode=0x%02x", bridge->vcp_ch, (unsigned)frame_len, opcode);
 
     /* Malformed frames still get a structured response when the opcode byte can be recovered. */
     if(!hx_validate_lrc(frame, frame_len) || !hx_parse_request_payload(payload, payload_len, &request)) {
@@ -990,6 +1388,11 @@ static bool he_bridge_handle_escape_frame(HeBridge* bridge, const uint8_t* frame
 }
 
 static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
+    if(!he_bridge_is_running(bridge)) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 3, bridge ? bridge->lifecycle : 0);
+        return;
+    }
+
     while(1) {
         size_t received = 0U;
 
@@ -998,10 +1401,17 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
             const size_t remaining = sizeof(bridge->cdc_accum) - bridge->cdc_accum_len;
             const size_t request_size = remaining > CDC_DATA_SZ ? CDC_DATA_SZ : remaining;
 
-            furi_check(furi_mutex_acquire(bridge->usb_mutex, FuriWaitForever) == FuriStatusOk);
+            if(!he_usb_lock(bridge)) {
+                return;
+            }
             const int32_t len =
                 furi_hal_cdc_receive(bridge->vcp_ch, bridge->cdc_accum + bridge->cdc_accum_len, request_size);
-            furi_check(furi_mutex_release(bridge->usb_mutex) == FuriStatusOk);
+            he_usb_unlock(bridge);
+            if(len <= 0) {
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceiveError, len, bridge->cdc_accum_len);
+            } else {
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceive, len, bridge->cdc_accum_len);
+            }
 
             if(len <= 0) {
                 break;
@@ -1033,6 +1443,7 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
                     bridge->cdc_accum_len,
                     sizeof(bridge->cdc_accum),
                     &frame_len);
+            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagFrameState, state, frame_len);
 
             if(state == HxFrameStateDesync || state == HxFrameStateInvalidLength) {
                 /* Resynchronize one byte at a time until the framing preamble is found again. */
@@ -1053,9 +1464,11 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
 
             if(hx_ccid_is_escape_frame(bridge->cdc_accum, frame_len)) {
                 /* Escape frames terminate locally and become HX protocol operations. */
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagEscapeDispatch, frame_len, 0);
                 he_bridge_handle_escape_frame(bridge, bridge->cdc_accum, frame_len);
             } else {
                 /* Ordinary CCID traffic is transparent and continues to the SAM UART. */
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagNonEscapeForward, frame_len, 0);
                 he_bridge_forward_frame_to_uart(bridge, bridge->cdc_accum, frame_len);
             }
 
@@ -1098,12 +1511,21 @@ static int32_t he_bridge_tx_thread(void* context) {
 static int32_t he_bridge_worker(void* context) {
     HeBridge* bridge = context;
 
+    he_log_tag("HEBridge", "worker start mode=%u vcp=%u uart=%u", bridge->mode, bridge->vcp_ch, bridge->uart_ch);
     bridge->worker_thread_id = furi_thread_get_current_id();
+    bridge->lifecycle = HeBridgeLifecycleStarting;
     bridge->init_status = HeBridgeInitStatusAllocFailed;
     bridge->rx_stream = furi_stream_buffer_alloc(HE_UART_RX_BUF_SIZE, 1U);
     bridge->tx_sem = furi_semaphore_alloc(1U, 1U);
     bridge->tx_thread = furi_thread_alloc_ex("HeBridgeTx", 1024U, he_bridge_tx_thread, bridge);
     bridge->serial_handle = furi_hal_serial_control_acquire(bridge->uart_ch);
+    he_log_tag(
+        "HEBridge",
+        "worker alloc rx_stream=%u tx_sem=%u tx_thread=%u serial=%u",
+        bridge->rx_stream != NULL,
+        bridge->tx_sem != NULL,
+        bridge->tx_thread != NULL,
+        bridge->serial_handle != NULL);
     if(!bridge->rx_stream || !bridge->tx_sem || !bridge->usb_mutex || !bridge->tx_thread) {
         bridge->init_status = HeBridgeInitStatusAllocFailed;
         goto init_failed;
@@ -1114,13 +1536,34 @@ static int32_t he_bridge_worker(void* context) {
     }
 
     /* The UART side must be live before CDC callbacks are installed and allowed to enqueue work. */
+    he_log_tag("HEBridge", "serial init ch=%u baud=%lu", bridge->uart_ch, (unsigned long)HE_BAUDRATE);
     furi_hal_serial_init(bridge->serial_handle, HE_BAUDRATE);
     furi_thread_start(bridge->tx_thread);
-    furi_hal_serial_dma_rx_start(bridge->serial_handle, he_bridge_on_uart_rx_dma, bridge, false);
+    he_log_tag("HEBridge", "tx thread started vcp=%u", bridge->vcp_ch);
+    if(bridge->uart_ch == FuriHalSerialIdUsart) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStartBegin, bridge->uart_ch, 0);
+        furi_hal_serial_async_rx_start(bridge->serial_handle, he_bridge_on_uart_rx_async, bridge, false);
+        bridge->serial_rx_started = true;
+        bridge->serial_rx_dma = false;
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStartEnd, bridge->uart_ch, 0);
+        he_log_tag("HEBridge", "async rx started uart=%u", bridge->uart_ch);
+    } else {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStartBegin, bridge->uart_ch, 1);
+        furi_hal_serial_dma_rx_start(bridge->serial_handle, he_bridge_on_uart_rx_dma, bridge, false);
+        bridge->serial_rx_started = true;
+        bridge->serial_rx_dma = true;
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStartEnd, bridge->uart_ch, 1);
+        he_log_tag("HEBridge", "dma rx started uart=%u", bridge->uart_ch);
+    }
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksBegin, 1, bridge->lifecycle);
     furi_hal_cdc_set_callbacks(bridge->vcp_ch, (CdcCallbacks*)&he_bridge_cdc_callbacks, bridge);
     bridge->cdc_callbacks_registered = true;
+    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksEnd, 1, bridge->lifecycle);
+    bridge->lifecycle = HeBridgeLifecycleRunning;
+    he_log_tag("HEBridge", "cdc callbacks registered vcp=%u", bridge->vcp_ch);
     he_bridge_signal_tx(bridge, HeWorkerEvtCdcRx);
     bridge->init_status = HeBridgeInitStatusOk;
+    he_log_tag("HEBridge", "worker ready vcp=%u", bridge->vcp_ch);
     furi_event_flag_set(bridge->init_event, HE_BRIDGE_INIT_READY_FLAG);
 
     while(1) {
@@ -1142,13 +1585,17 @@ static int32_t he_bridge_worker(void* context) {
     }
 
     /* Teardown order matters: stop callbacks and TX thread before releasing UART resources. */
+    bridge->lifecycle = HeBridgeLifecycleStopping;
     if(bridge->cdc_callbacks_registered) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksBegin, 0, bridge->lifecycle);
         furi_hal_cdc_set_callbacks(bridge->vcp_ch, NULL, NULL);
         bridge->cdc_callbacks_registered = false;
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksEnd, 0, bridge->lifecycle);
     }
     bridge->cdc_connected = false;
     he_bridge_release_tx_slot(bridge);
     if(bridge->tx_thread) {
+        he_log_tag("HEBridge", "stopping tx thread vcp=%u", bridge->vcp_ch);
         he_bridge_signal_tx(bridge, HeWorkerEvtTxStop);
         furi_thread_join(bridge->tx_thread);
         furi_thread_free(bridge->tx_thread);
@@ -1156,8 +1603,24 @@ static int32_t he_bridge_worker(void* context) {
         bridge->tx_thread_id = NULL;
     }
     if(bridge->serial_handle) {
+        if(bridge->serial_rx_started) {
+            if(bridge->serial_rx_dma) {
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStopBegin, bridge->uart_ch, 1);
+                he_log_tag("HEBridge", "stopping dma rx uart=%u", bridge->uart_ch);
+                furi_hal_serial_dma_rx_stop(bridge->serial_handle);
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStopEnd, bridge->uart_ch, 1);
+            } else {
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStopBegin, bridge->uart_ch, 0);
+                he_log_tag("HEBridge", "stopping async rx uart=%u", bridge->uart_ch);
+                furi_hal_serial_async_rx_stop(bridge->serial_handle);
+                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRxStopEnd, bridge->uart_ch, 0);
+            }
+            bridge->serial_rx_started = false;
+        }
+        he_log_tag("HEBridge", "serial deinit uart=%u", bridge->uart_ch);
         furi_hal_serial_deinit(bridge->serial_handle);
         furi_hal_serial_control_release(bridge->serial_handle);
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRelease, bridge->uart_ch, 0);
         bridge->serial_handle = NULL;
     }
     if(bridge->rx_stream) {
@@ -1169,13 +1632,19 @@ static int32_t he_bridge_worker(void* context) {
         bridge->tx_sem = NULL;
     }
     bridge->worker_thread_id = NULL;
+    bridge->lifecycle = HeBridgeLifecycleStopped;
+    he_log_tag("HEBridge", "worker stop vcp=%u", bridge->vcp_ch);
     return 0;
 
 init_failed:
+    he_log_tag("HEBridge", "worker init failed vcp=%u status=%u", bridge->vcp_ch, bridge->init_status);
     /* Mirror the normal cleanup path so partial startup cannot leak callbacks or UART ownership. */
+    bridge->lifecycle = HeBridgeLifecycleStopping;
     if(bridge->cdc_callbacks_registered) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksBegin, 0, bridge->lifecycle);
         furi_hal_cdc_set_callbacks(bridge->vcp_ch, NULL, NULL);
         bridge->cdc_callbacks_registered = false;
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcCallbacksEnd, 0, bridge->lifecycle);
     }
     bridge->cdc_connected = false;
     furi_event_flag_set(bridge->init_event, HE_BRIDGE_INIT_READY_FLAG);
@@ -1186,6 +1655,7 @@ init_failed:
     }
     if(bridge->serial_handle) {
         furi_hal_serial_control_release(bridge->serial_handle);
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagSerialRelease, bridge->uart_ch, 1);
         bridge->serial_handle = NULL;
     }
     if(bridge->rx_stream) {
@@ -1197,12 +1667,21 @@ init_failed:
         bridge->tx_sem = NULL;
     }
     bridge->worker_thread_id = NULL;
+    bridge->lifecycle = HeBridgeLifecycleStopped;
     return -1;
 }
 
 static bool he_bridge_start(HeBridge* bridge) {
+    he_log_tag("HEBridge", "bridge start requested mode=%u vcp=%u", bridge->mode, bridge->vcp_ch);
+    bridge->lifecycle = HeBridgeLifecycleStarting;
     bridge->init_event = furi_event_flag_alloc();
     bridge->thread = furi_thread_alloc_ex("HeBridge", 2048U, he_bridge_worker, bridge);
+    he_log_tag(
+        "HEBridge",
+        "bridge start alloc vcp=%u init_event=%u thread=%u",
+        bridge->vcp_ch,
+        bridge->init_event != NULL,
+        bridge->thread != NULL);
     if(!bridge->init_event || !bridge->thread) {
         bridge->init_status = HeBridgeInitStatusAllocFailed;
         if(bridge->thread) {
@@ -1215,19 +1694,49 @@ static bool he_bridge_start(HeBridge* bridge) {
         }
         return false;
     }
+    furi_thread_set_state_callback(bridge->thread, he_bridge_thread_state_callback);
+    furi_thread_set_state_context(bridge->thread, bridge);
     furi_thread_set_priority(bridge->thread, FuriThreadPriorityHigh);
+    he_log_tag(
+        "HEBridge",
+        "bridge start preflight vcp=%u uart_busy=%u",
+        bridge->vcp_ch,
+        furi_hal_serial_control_is_busy(bridge->uart_ch) ? 1U : 0U);
+    he_log_tag("HEBridge", "bridge start before thread start vcp=%u", bridge->vcp_ch);
     furi_thread_start(bridge->thread);
+    he_log_tag(
+        "HEBridge",
+        "bridge start after thread start vcp=%u state=%s",
+        bridge->vcp_ch,
+        he_thread_state_label(furi_thread_get_state(bridge->thread)));
     /* Startup is synchronous from the app's perspective: wait for the worker to report readiness. */
-    furi_event_flag_wait(
-        bridge->init_event, HE_BRIDGE_INIT_READY_FLAG, FuriFlagWaitAny, FuriWaitForever);
+    const uint32_t init_flags = furi_event_flag_wait(
+        bridge->init_event, HE_BRIDGE_INIT_READY_FLAG, FuriFlagWaitAny, HE_BRIDGE_INIT_TIMEOUT_MS);
+    he_log_tag(
+        "HEBridge",
+        "bridge start after wait vcp=%u flags=0x%08lx state=%s",
+        bridge->vcp_ch,
+        (unsigned long)init_flags,
+        he_thread_state_label(furi_thread_get_state(bridge->thread)));
     furi_event_flag_free(bridge->init_event);
     bridge->init_event = NULL;
-    if(bridge->init_status != HeBridgeInitStatusOk) {
+    if(!(init_flags & HE_BRIDGE_INIT_READY_FLAG)) {
+        bridge->init_status = HeBridgeInitStatusAllocFailed;
+        he_log_tag("HEBridge", "bridge start timeout vcp=%u", bridge->vcp_ch);
+        he_bridge_signal_worker(bridge, HeWorkerEvtStop);
         furi_thread_join(bridge->thread);
         furi_thread_free(bridge->thread);
         bridge->thread = NULL;
         return false;
     }
+    if(bridge->init_status != HeBridgeInitStatusOk) {
+        he_log_tag("HEBridge", "bridge start failed vcp=%u status=%u", bridge->vcp_ch, bridge->init_status);
+        furi_thread_join(bridge->thread);
+        furi_thread_free(bridge->thread);
+        bridge->thread = NULL;
+        return false;
+    }
+    he_log_tag("HEBridge", "bridge start ok vcp=%u", bridge->vcp_ch);
     return true;
 }
 
@@ -1235,33 +1744,54 @@ static void he_bridge_stop(HeBridge* bridge) {
     if(!bridge->thread) {
         return;
     }
+    bridge->lifecycle = HeBridgeLifecycleStopping;
+    he_log_tag("HEBridge", "bridge stop requested vcp=%u", bridge->vcp_ch);
     he_bridge_signal_worker(bridge, HeWorkerEvtStop);
+    he_log_tag("HEBridge", "waiting for worker join vcp=%u", bridge->vcp_ch);
     furi_thread_join(bridge->thread);
     furi_thread_free(bridge->thread);
     bridge->thread = NULL;
+    he_log_tag("HEBridge", "bridge stop complete vcp=%u", bridge->vcp_ch);
 }
 
 static HardwareExerciserApp* he_app_alloc(void) {
+    he_log("app alloc begin");
     HardwareExerciserApp* app = calloc(1U, sizeof(HardwareExerciserApp));
     if(!app) {
+        he_log("app alloc failed");
         return NULL;
     }
 
     app->gui = furi_record_open(RECORD_GUI);
     app->cli_vcp = furi_record_open(RECORD_CLI_VCP);
+    app->expansion = furi_record_open(RECORD_EXPANSION);
     app->event_queue = furi_message_queue_alloc(8U, sizeof(HeAppEvent));
     app->view_port = view_port_alloc();
     app->hw_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->usb_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
-    if(!app->event_queue || !app->view_port || !app->hw_mutex || !app->usb_mutex) {
+    if(!app->event_queue || !app->view_port || !app->hw_mutex || !app->usb_mutex ||
+       !he_gpio_init(&app->gpio)) {
+        he_log(
+            "app alloc partial failure event_queue=%u view_port=%u hw_mutex=%u usb_mutex=%u",
+            app->event_queue != NULL,
+            app->view_port != NULL,
+            app->hw_mutex != NULL,
+            app->usb_mutex != NULL);
         if(app->view_port) view_port_free(app->view_port);
         if(app->event_queue) furi_message_queue_free(app->event_queue);
         if(app->hw_mutex) furi_mutex_free(app->hw_mutex);
         if(app->usb_mutex) furi_mutex_free(app->usb_mutex);
+        if(app->expansion) furi_record_close(RECORD_EXPANSION);
         furi_record_close(RECORD_CLI_VCP);
         furi_record_close(RECORD_GUI);
         free(app);
         return NULL;
+    }
+
+    if(app->expansion) {
+        he_log("disabling expansion");
+        expansion_disable(app->expansion);
+        app->expansion_disabled = true;
     }
 
     view_port_draw_callback_set(app->view_port, he_view_draw_callback, app);
@@ -1281,15 +1811,27 @@ static HardwareExerciserApp* he_app_alloc(void) {
     app->uhf_bridge.vcp_ch = 1U;
     app->uhf_bridge.uart_ch = FuriHalSerialIdUsart;
     app->uhf_bridge.usb_mutex = app->usb_mutex;
+    app->ui_dirty = true;
+    he_log("app alloc complete");
     return app;
 }
 
 static void he_app_free(HardwareExerciserApp* app) {
+    he_log("app free begin");
+    he_gpio_free(&app->gpio);
     gui_remove_view_port(app->gui, app->view_port);
     view_port_free(app->view_port);
     furi_message_queue_free(app->event_queue);
     furi_mutex_free(app->hw_mutex);
     furi_mutex_free(app->usb_mutex);
+    if(app->expansion_disabled && app->expansion) {
+        he_log("re-enabling expansion");
+        expansion_enable(app->expansion);
+        app->expansion_disabled = false;
+    }
+    if(app->expansion) {
+        furi_record_close(RECORD_EXPANSION);
+    }
     furi_record_close(RECORD_CLI_VCP);
     furi_record_close(RECORD_GUI);
     free(app);
@@ -1298,44 +1840,98 @@ static void he_app_free(HardwareExerciserApp* app) {
 int32_t hardware_exerciser_app(void* p) {
     UNUSED(p);
 
+    he_log_reset();
+    he_log("app entry");
     HardwareExerciserApp* app = he_app_alloc();
     if(!app) {
+        he_log("app alloc returned null");
         return 255;
     }
     app->usb_prev = furi_hal_usb_get_config();
+    he_log("captured previous usb config=%p", app->usb_prev);
     furi_hal_usb_unlock();
+    he_log("usb unlock complete");
     cli_vcp_disable(app->cli_vcp);
+    he_log("cli vcp disabled");
     /* Switch the device into dual CDC mode so both bridges are available to the host at once. */
-    furi_check(furi_hal_usb_set_config(&usb_cdc_dual, NULL) == true);
+    he_log("setting dual cdc config");
+    he_diag_record(app, 0xffU, HeDiagUsbConfigBegin, 1, 0);
+    const bool usb_config_ok = furi_hal_usb_set_config(&usb_cdc_dual, NULL);
+    he_diag_record(app, 0xffU, HeDiagUsbConfigEnd, usb_config_ok ? 1 : 0, 0);
+    if(!usb_config_ok) {
+        he_log("dual cdc config failed");
+        cli_vcp_enable(app->cli_vcp);
+        app->startup_failed = true;
+        app->ui_dirty = true;
+        he_diag_flush(app);
+        while(true) {
+            HeAppEvent event = {0};
+            if(furi_message_queue_get(app->event_queue, &event, 100U) == FuriStatusOk) {
+                if(event.input.type == InputTypeLong && event.input.key == InputKeyBack) {
+                    break;
+                }
+            }
+            if(app->ui_dirty) {
+                view_port_update(app->view_port);
+                app->ui_dirty = false;
+            }
+        }
+        he_app_free(app);
+        return 255;
+    }
+    he_log("dual cdc config applied");
 
     const bool sam_started = he_bridge_start(&app->sam_bridge);
     const bool uhf_started = he_bridge_start(&app->uhf_bridge);
+    he_log("bridge start results sam=%u uhf=%u", sam_started, uhf_started);
     if(!sam_started || !uhf_started) {
         /* Fall back to a status screen instead of exiting immediately so startup errors are visible. */
         he_bridge_stop(&app->uhf_bridge);
         he_bridge_stop(&app->sam_bridge);
+        he_diag_record(app, 0xffU, HeDiagUsbConfigBegin, 0, 0);
         furi_hal_usb_set_config(app->usb_prev, NULL);
+        he_diag_record(app, 0xffU, HeDiagUsbConfigEnd, 0, 1);
         cli_vcp_enable(app->cli_vcp);
         app->startup_failed = true;
+        app->ui_dirty = true;
+        he_log("startup failed, restored previous usb config");
         view_port_update(app->view_port);
     }
 
     while(1) {
+        he_diag_flush(app);
+        if(app->ui_dirty) {
+            view_port_update(app->view_port);
+            app->ui_dirty = false;
+        }
         HeAppEvent event = {0};
         if(furi_message_queue_get(app->event_queue, &event, 100U) == FuriStatusOk) {
             if(event.input.type == InputTypeLong && event.input.key == InputKeyBack) {
+                he_log("back button exit requested");
                 break;
             }
+        }
+        if(app->exit_requested) {
+            he_log("processing requested quit");
+            break;
         }
     }
 
     if(!app->startup_failed) {
         /* Restore the original USB configuration and CLI only after both bridges are stopped. */
+        he_log("normal shutdown path");
         he_bridge_stop(&app->uhf_bridge);
         he_bridge_stop(&app->sam_bridge);
+        he_log("restoring usb config");
+        he_diag_record(app, 0xffU, HeDiagUsbConfigBegin, 0, 0);
         furi_hal_usb_set_config(app->usb_prev, NULL);
+        he_diag_record(app, 0xffU, HeDiagUsbConfigEnd, 0, 1);
+        he_log("re-enabling cli vcp");
         cli_vcp_enable(app->cli_vcp);
+        he_log("usb config restored and cli enabled");
     }
+    he_diag_flush(app);
     he_app_free(app);
+    he_log("app exit");
     return 0;
 }

@@ -6,3 +6,5 @@ logs/
 credential/
 build/
 debug/
+__pycache__/
+refrence/

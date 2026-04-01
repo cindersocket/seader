@@ -248,6 +248,125 @@ static MunitResult test_build_escape_response_preserves_slot_and_seq(
     return MUNIT_OK;
 }
 
+static MunitResult test_parse_gpio_configure_request(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* GPIO configure requests are fixed-width so malformed bodies fail early. */
+    const uint8_t body[] = {0x07, HxGpioModeOutputPushPull, HxGpioPullUp, 0x01};
+    HxGpioConfigureRequest request = {0};
+
+    munit_assert_true(hx_parse_gpio_configure_request(body, sizeof(body), &request));
+    munit_assert_uint8(request.pin_number, ==, 0x07);
+    munit_assert_uint8(request.mode, ==, HxGpioModeOutputPushPull);
+    munit_assert_uint8(request.pull, ==, HxGpioPullUp);
+    munit_assert_uint8(request.initial_level, ==, 0x01);
+    return MUNIT_OK;
+}
+
+static MunitResult test_parse_gpio_vector_request(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* Vector bodies carry grouped writes, one settle delay, then ordered sample descriptors. */
+    const uint8_t body[] = {
+        0x02,
+        0x07,
+        0x01,
+        0x15,
+        0x00,
+        0x2c,
+        0x01,
+        0x00,
+        0x00,
+        0x03,
+        0x07,
+        HxGpioSampleDigital,
+        0x15,
+        HxGpioSampleAnalog,
+        0x16,
+        HxGpioSampleDigital,
+    };
+    HxGpioVectorRequest request = {0};
+    HxGpioWriteRequest write = {0};
+    HxGpioVectorSample sample = {0};
+
+    munit_assert_true(hx_parse_gpio_vector_request(body, sizeof(body), &request));
+    munit_assert_size(request.write_count, ==, 2U);
+    munit_assert_uint32(request.settle_us, ==, 300U);
+    munit_assert_size(request.sample_count, ==, 3U);
+
+    munit_assert_true(hx_gpio_vector_write_at(&request, 0U, &write));
+    munit_assert_uint8(write.pin_number, ==, 0x07);
+    munit_assert_uint8(write.level, ==, 0x01);
+    munit_assert_true(hx_gpio_vector_write_at(&request, 1U, &write));
+    munit_assert_uint8(write.pin_number, ==, 0x15);
+    munit_assert_uint8(write.level, ==, 0x00);
+
+    munit_assert_true(hx_gpio_vector_sample_at(&request, 1U, &sample));
+    munit_assert_uint8(sample.pin_number, ==, 0x15);
+    munit_assert_uint8(sample.sample_kind, ==, HxGpioSampleAnalog);
+    return MUNIT_OK;
+}
+
+static MunitResult test_parse_gpio_vector_request_rejects_truncated(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* Sample descriptors must consume the remaining body exactly. */
+    const uint8_t body[] = {0x01, 0x07, 0x01, 0x10, 0x00, 0x00, 0x00, 0x02, 0x07, 0x00, 0x15};
+    HxGpioVectorRequest request = {0};
+
+    munit_assert_false(hx_parse_gpio_vector_request(body, sizeof(body), &request));
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_gpio_pin_info(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* Discovery entries expose connector number, capability flags, and firmware pin name. */
+    uint8_t out[16] = {0};
+    const size_t len = hx_build_gpio_pin_info(
+        0x07, HX_GPIO_PIN_FLAG_DIGITAL | HX_GPIO_PIN_FLAG_ANALOG, "PC3", out, sizeof(out));
+
+    const uint8_t expected[] = {0x07, 0x03, 0x03, 'P', 'C', '3'};
+    munit_assert_size(len, ==, sizeof(expected));
+    munit_assert_memory_equal(sizeof(expected), out, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_gpio_analog_value(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* Analog reads return both the raw ADC sample and its millivolt conversion. */
+    uint8_t out[8] = {0};
+    const size_t len = hx_build_gpio_analog_value(0x0123, 0x0456, out, sizeof(out));
+
+    const uint8_t expected[] = {0x23, 0x01, 0x56, 0x04};
+    munit_assert_size(len, ==, sizeof(expected));
+    munit_assert_memory_equal(sizeof(expected), out, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_build_gpio_vector_sample(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    /* Vector samples preserve request order and include an aux field for analog millivolts. */
+    uint8_t out[8] = {0};
+    const size_t len =
+        hx_build_gpio_vector_sample(0x15, HxGpioSampleAnalog, 0x0123, 0x0456, out, sizeof(out));
+
+    const uint8_t expected[] = {0x15, HxGpioSampleAnalog, 0x23, 0x01, 0x56, 0x04};
+    munit_assert_size(len, ==, sizeof(expected));
+    munit_assert_memory_equal(sizeof(expected), out, expected);
+    return MUNIT_OK;
+}
+
 static MunitTest test_hardware_exerciser_protocol_cases[] = {
     {(char*)"/parse-complete-escape-frame",
      test_parse_complete_escape_frame,
@@ -306,6 +425,42 @@ static MunitTest test_hardware_exerciser_protocol_cases[] = {
      NULL},
     {(char*)"/build-escape-response-preserves-slot-and-seq",
      test_build_escape_response_preserves_slot_and_seq,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/parse-gpio-configure-request",
+     test_parse_gpio_configure_request,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/parse-gpio-vector-request",
+     test_parse_gpio_vector_request,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/parse-gpio-vector-request-rejects-truncated",
+     test_parse_gpio_vector_request_rejects_truncated,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/build-gpio-pin-info",
+     test_build_gpio_pin_info,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/build-gpio-analog-value",
+     test_build_gpio_analog_value,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/build-gpio-vector-sample",
+     test_build_gpio_vector_sample,
      NULL,
      NULL,
      MUNIT_TEST_OPTION_NONE,

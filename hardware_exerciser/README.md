@@ -82,6 +82,14 @@ Response payload body layout is:
 | `0x20` | `Hf15693Scan` | None | `uid_len`, `uid`, `flags`, `block_size`, `block_count_le16` |
 | `0x21` | `Hf15693TxRx` | `fwt_fc_le32` followed by raw frame bytes | Raw response frame bytes |
 | `0x30` | `LfReadDecoded` | None | `protocol_id`, `name_len`, `data_len`, `rendered_len`, then `name`, `protocol_data`, `rendered_text` |
+| `0x40` | `GpioListPins` | None | `pin_count`, then repeated `pin_number`, `flags`, `name_len`, `name` |
+| `0x41` | `GpioConfigure` | `pin_number`, `mode`, `pull`, `initial_level` | Empty success response |
+| `0x42` | `GpioWrite` | `pin_number`, `level` | Empty success response |
+| `0x43` | `GpioRead` | `pin_number` | `level` |
+| `0x44` | `GpioReadAnalog` | `pin_number` | `raw_adc_le16`, `millivolts_le16` |
+| `0x45` | `GpioVectorCapture` | `write_count`, writes, `settle_us_le32`, `sample_count`, samples | `sample_count`, then repeated `pin_number`, `sample_kind`, `value_le16`, `aux_le16` |
+| `0x46` | `GpioReset` | None | Empty success response |
+| `0x7e` | `Quit` | None | Empty success response |
 | `0x7f` | `Abort` | None | Empty success response |
 
 ## Status Codes
@@ -108,6 +116,49 @@ Response payload body layout is:
 - `HX_CAP_HF15693_SCAN`
 - `HX_CAP_HF15693_TXRX`
 - `HX_CAP_LF_READ_DECODED`
+- `HX_CAP_GPIO_LIST_PINS`
+- `HX_CAP_GPIO_CONFIGURE`
+- `HX_CAP_GPIO_WRITE`
+- `HX_CAP_GPIO_READ`
+- `HX_CAP_GPIO_READ_ANALOG`
+- `HX_CAP_GPIO_VECTOR`
+- `HX_CAP_GPIO_RESET`
+- `HX_CAP_QUIT`
+
+## GPIO Details
+
+GPIO requests target safe external connector pins only. Host requests identify a pin by connector number, while `GpioListPins` returns the corresponding firmware name such as `PA7` or `PC3`.
+
+`GpioListPins` flags currently mean:
+
+- bit `0`: digital IO supported
+- bit `1`: analog sampling supported
+
+GPIO modes are encoded as:
+
+- `0`: input
+- `1`: output push-pull
+- `2`: output open-drain
+- `3`: analog
+
+GPIO pulls are encoded as:
+
+- `0`: none
+- `1`: pull-up
+- `2`: pull-down
+
+Vector capture request bodies are laid out as:
+
+- `write_count u8`
+- repeated writes: `pin_number u8 | level u8`
+- `settle_us u32le`
+- `sample_count u8`
+- repeated samples: `pin_number u8 | sample_kind u8`
+
+Vector sample kinds are:
+
+- `0`: digital sample, returned as `value=0/1`, `aux=0`
+- `1`: analog sample, returned as `value=raw_adc`, `aux=millivolts`
 
 ## Host Helper
 
@@ -117,3 +168,4 @@ Response payload body layout is:
 - It writes the frame to the selected serial port.
 - It waits for a full response header and payload.
 - It prints the raw response frame as hex.
+- It supports convenience subcommands for `list-pins`, `configure`, `write`, `read`, `read-analog`, `vector`, `reset`, and `quit`, plus a generic `raw` mode for arbitrary opcodes.

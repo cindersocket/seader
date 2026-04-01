@@ -133,6 +133,103 @@ bool hx_copy_response_body(
     return true;
 }
 
+bool hx_parse_gpio_configure_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxGpioConfigureRequest* request) {
+    if(!body || !request || body_len != 4U) {
+        return false;
+    }
+
+    request->pin_number = body[0];
+    request->mode = body[1];
+    request->pull = body[2];
+    request->initial_level = body[3];
+    return true;
+}
+
+bool hx_parse_gpio_write_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxGpioWriteRequest* request) {
+    if(!body || !request || body_len != 2U) {
+        return false;
+    }
+
+    request->pin_number = body[0];
+    request->level = body[1];
+    return true;
+}
+
+bool hx_parse_gpio_pin_request(const uint8_t* body, size_t body_len, uint8_t* pin_number) {
+    if(!body || !pin_number || body_len != 1U) {
+        return false;
+    }
+
+    *pin_number = body[0];
+    return true;
+}
+
+bool hx_parse_gpio_vector_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxGpioVectorRequest* request) {
+    if(!body || !request || body_len < 6U) {
+        return false;
+    }
+
+    const size_t write_count = body[0];
+    const size_t writes_len = write_count * 2U;
+    if(writes_len > body_len - 6U) {
+        return false;
+    }
+
+    const size_t settle_offset = 1U + writes_len;
+    const size_t sample_count_offset = settle_offset + 4U;
+    if(sample_count_offset >= body_len) {
+        return false;
+    }
+
+    const size_t sample_count = body[sample_count_offset];
+    const size_t samples_len = sample_count * 2U;
+    if(samples_len != body_len - (sample_count_offset + 1U)) {
+        return false;
+    }
+
+    request->writes = body + 1U;
+    request->write_count = write_count;
+    request->settle_us = hx_read_le32(body + settle_offset);
+    request->samples = body + sample_count_offset + 1U;
+    request->sample_count = sample_count;
+    return true;
+}
+
+bool hx_gpio_vector_write_at(
+    const HxGpioVectorRequest* request,
+    size_t index,
+    HxGpioWriteRequest* write) {
+    if(!request || !write || index >= request->write_count) {
+        return false;
+    }
+
+    write->pin_number = request->writes[index * 2U];
+    write->level = request->writes[index * 2U + 1U];
+    return true;
+}
+
+bool hx_gpio_vector_sample_at(
+    const HxGpioVectorRequest* request,
+    size_t index,
+    HxGpioVectorSample* sample) {
+    if(!request || !sample || index >= request->sample_count) {
+        return false;
+    }
+
+    sample->pin_number = request->samples[index * 2U];
+    sample->sample_kind = request->samples[index * 2U + 1U];
+    return true;
+}
+
 size_t hx_build_hf14a_scan_payload(
     const uint8_t* uid,
     size_t uid_len,
@@ -192,6 +289,65 @@ size_t hx_build_response_payload(
     }
 
     return total_len;
+}
+
+size_t hx_build_gpio_pin_info(
+    uint8_t pin_number,
+    uint8_t flags,
+    const char* name,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!name || !out) {
+        return 0U;
+    }
+
+    const size_t name_len = strlen(name);
+    const size_t total_len = 3U + name_len;
+    if(name_len > 255U || out_cap < total_len) {
+        return 0U;
+    }
+
+    out[0] = pin_number;
+    out[1] = flags;
+    out[2] = (uint8_t)name_len;
+    memcpy(out + 3U, name, name_len);
+    return total_len;
+}
+
+size_t hx_build_gpio_analog_value(
+    uint16_t raw_value,
+    uint16_t millivolts,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 4U) {
+        return 0U;
+    }
+
+    out[0] = (uint8_t)(raw_value & 0xffU);
+    out[1] = (uint8_t)((raw_value >> 8) & 0xffU);
+    out[2] = (uint8_t)(millivolts & 0xffU);
+    out[3] = (uint8_t)((millivolts >> 8) & 0xffU);
+    return 4U;
+}
+
+size_t hx_build_gpio_vector_sample(
+    uint8_t pin_number,
+    uint8_t sample_kind,
+    uint16_t value,
+    uint16_t aux,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 6U) {
+        return 0U;
+    }
+
+    out[0] = pin_number;
+    out[1] = sample_kind;
+    out[2] = (uint8_t)(value & 0xffU);
+    out[3] = (uint8_t)((value >> 8) & 0xffU);
+    out[4] = (uint8_t)(aux & 0xffU);
+    out[5] = (uint8_t)((aux >> 8) & 0xffU);
+    return 6U;
 }
 
 size_t hx_build_ccid_escape_response(
