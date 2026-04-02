@@ -27,12 +27,25 @@ typedef enum {
     SeaderBoardRuntimeEventActionBoardPowerLost,
 } SeaderBoardRuntimeEventAction;
 
+typedef enum {
+    SeaderBoardAttachmentUnknownOrNone = 0,
+    SeaderBoardAttachmentSamOnly,
+    SeaderBoardAttachmentUhfCarrier,
+} SeaderBoardAttachment;
+
 typedef struct {
     bool should_enable_otg;
     bool owns_otg;
+    bool should_assert_enable;
+    bool should_validate_power;
+    bool should_monitor_runtime;
 } SeaderBoardPowerAcquirePlan;
 
-SeaderBoardPowerAcquirePlan seader_board_power_plan_acquire(bool otg_already_enabled);
+SeaderBoardAttachment
+    seader_board_attachment_classify(bool pa4_high, bool pc1_high, bool pc0_high);
+const char* seader_board_attachment_label(SeaderBoardAttachment attachment);
+SeaderBoardPowerAcquirePlan
+    seader_board_power_plan_acquire(SeaderBoardAttachment attachment, bool otg_already_enabled);
 bool seader_board_power_is_available(bool otg_enabled, uint16_t vbus_mv);
 SeaderBoardRuntimePowerState seader_board_runtime_power_state(
     bool otg_requested,

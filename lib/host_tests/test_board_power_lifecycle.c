@@ -8,9 +8,13 @@ static MunitResult test_acquire_plan_when_otg_is_off(
     (void)params;
     (void)fixture;
 
-    SeaderBoardPowerAcquirePlan plan = seader_board_power_plan_acquire(false);
+    SeaderBoardPowerAcquirePlan plan =
+        seader_board_power_plan_acquire(SeaderBoardAttachmentUhfCarrier, false);
     munit_assert_true(plan.should_enable_otg);
     munit_assert_true(plan.owns_otg);
+    munit_assert_true(plan.should_assert_enable);
+    munit_assert_true(plan.should_validate_power);
+    munit_assert_true(plan.should_monitor_runtime);
     return MUNIT_OK;
 }
 
@@ -20,9 +24,68 @@ static MunitResult test_acquire_plan_when_otg_is_already_on(
     (void)params;
     (void)fixture;
 
-    SeaderBoardPowerAcquirePlan plan = seader_board_power_plan_acquire(true);
+    SeaderBoardPowerAcquirePlan plan =
+        seader_board_power_plan_acquire(SeaderBoardAttachmentUhfCarrier, true);
     munit_assert_false(plan.should_enable_otg);
     munit_assert_false(plan.owns_otg);
+    munit_assert_true(plan.should_assert_enable);
+    munit_assert_true(plan.should_validate_power);
+    munit_assert_true(plan.should_monitor_runtime);
+    return MUNIT_OK;
+}
+
+static MunitResult test_acquire_plan_skips_uhf_power_for_non_uhf_boards(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    SeaderBoardPowerAcquirePlan sam_only_plan =
+        seader_board_power_plan_acquire(SeaderBoardAttachmentSamOnly, false);
+    munit_assert_false(sam_only_plan.should_enable_otg);
+    munit_assert_false(sam_only_plan.owns_otg);
+    munit_assert_true(sam_only_plan.should_assert_enable);
+    munit_assert_false(sam_only_plan.should_validate_power);
+    munit_assert_false(sam_only_plan.should_monitor_runtime);
+
+    SeaderBoardPowerAcquirePlan unknown_plan =
+        seader_board_power_plan_acquire(SeaderBoardAttachmentUnknownOrNone, false);
+    munit_assert_false(unknown_plan.should_enable_otg);
+    munit_assert_false(unknown_plan.owns_otg);
+    munit_assert_false(unknown_plan.should_assert_enable);
+    munit_assert_false(unknown_plan.should_validate_power);
+    munit_assert_false(unknown_plan.should_monitor_runtime);
+
+    return MUNIT_OK;
+}
+
+static MunitResult test_attachment_classification_prefers_pa4_for_uhf(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    munit_assert_int(
+        seader_board_attachment_classify(true, false, false),
+        ==,
+        SeaderBoardAttachmentUhfCarrier);
+    munit_assert_int(
+        seader_board_attachment_classify(true, true, true),
+        ==,
+        SeaderBoardAttachmentUhfCarrier);
+    munit_assert_int(
+        seader_board_attachment_classify(false, true, false),
+        ==,
+        SeaderBoardAttachmentSamOnly);
+    munit_assert_int(
+        seader_board_attachment_classify(false, false, true),
+        ==,
+        SeaderBoardAttachmentSamOnly);
+    munit_assert_int(
+        seader_board_attachment_classify(false, false, false),
+        ==,
+        SeaderBoardAttachmentUnknownOrNone);
+
     return MUNIT_OK;
 }
 
@@ -182,6 +245,18 @@ static MunitTest test_board_power_lifecycle_cases[] = {
      NULL},
     {(char*)"/acquire-otg-on",
      test_acquire_plan_when_otg_is_already_on,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/acquire-non-uhf-skips-power",
+     test_acquire_plan_skips_uhf_power_for_non_uhf_boards,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/classify-attachment",
+     test_attachment_classification_prefers_pa4_for_uhf,
      NULL,
      NULL,
      MUNIT_TEST_OPTION_NONE,

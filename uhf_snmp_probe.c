@@ -261,7 +261,12 @@ bool seader_uhf_snmp_probe_consume_error(
 
     if(error_code == 0x11U && data_len >= 2U &&
        ((data[0] == 0x2EU && data[1] == 0x00U) || (data[0] == 0x39U && data[1] == 0x00U))) {
-        if(probe->stage == SeaderUhfSnmpProbeStageReadMonza4QtKey) {
+        if(probe->stage == SeaderUhfSnmpProbeStageReadTagConfig) {
+            probe->has_monza4qt = false;
+            probe->has_higgs3 = false;
+            probe->stage = SeaderUhfSnmpProbeStageDone;
+            return true;
+        } else if(probe->stage == SeaderUhfSnmpProbeStageReadMonza4QtKey) {
             probe->monza4qt_key_present = false;
             seader_uhf_snmp_probe_advance_after_monza(probe);
             return true;

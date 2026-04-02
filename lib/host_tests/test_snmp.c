@@ -285,6 +285,38 @@ static MunitResult test_get_data_request_fits_bounded_transport_buffer(
     return MUNIT_OK;
 }
 
+static MunitResult test_probe_missing_tag_config_treated_as_no_uhf_module(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    SeaderUhfSnmpProbe probe = {0};
+    uint8_t response[512] = {0};
+    size_t response_len = 0U;
+
+    seader_uhf_snmp_probe_init(&probe);
+
+    response_len = test_hex_to_bytes(snmp_discovery_response_hex, response, sizeof(response));
+    munit_assert_true(seader_uhf_snmp_probe_consume_response(&probe, response, response_len));
+    munit_assert_int(probe.stage, ==, SeaderUhfSnmpProbeStageReadIce);
+
+    response_len = test_hex_to_bytes(snmp_ice_response_hex, response, sizeof(response));
+    munit_assert_true(seader_uhf_snmp_probe_consume_response(&probe, response, response_len));
+    munit_assert_int(probe.stage, ==, SeaderUhfSnmpProbeStageReadTagConfig);
+    munit_assert_size(probe.ice_value_len, ==, 7);
+    munit_assert_memory_equal(7, probe.ice_value_storage, "ICE1803");
+
+    munit_assert_true(seader_uhf_snmp_probe_consume_error(
+        &probe, 0x11U, (const uint8_t*)"\x2E\x00", 2U));
+    munit_assert_false(probe.has_monza4qt);
+    munit_assert_false(probe.has_higgs3);
+    munit_assert_false(probe.monza4qt_key_present);
+    munit_assert_false(probe.higgs3_key_present);
+    munit_assert_int(probe.stage, ==, SeaderUhfSnmpProbeStageDone);
+    return MUNIT_OK;
+}
+
 static MunitResult test_tag_config_view_extracts_known_entries(const MunitParameter params[], void* fixture) {
     (void)params;
     (void)fixture;
@@ -328,6 +360,7 @@ static MunitTest test_snmp_cases[] = {
     {(char*)"/parse-values", test_parse_ice_and_tag_config_values, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/probe", test_probe_stages, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/probe-runtime-buffers", test_probe_full_sequence_succeeds_with_runtime_sized_buffers, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/probe-missing-tag-config", test_probe_missing_tag_config_treated_as_no_uhf_module, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/bounded-get-data", test_get_data_request_fits_bounded_transport_buffer, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/tag-config", test_tag_config_view_extracts_known_entries, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/malformed-length", test_response_rejects_truncated_length, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},

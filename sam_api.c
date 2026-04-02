@@ -174,6 +174,11 @@ static void seader_start_snmp_probe(Seader* seader) {
 
     if(seader->hf_session_state != SeaderHfSessionStateUnloaded ||
        seader->mode_runtime != SeaderModeRuntimeNone) {
+        seader_trace(
+            TAG,
+            "skip snmp probe hf_state=%d mode_runtime=%d",
+            seader ? (int)seader->hf_session_state : -1,
+            seader ? (int)seader->mode_runtime : -1);
         seader_snmp_probe_finish(seader);
         return;
     }
@@ -188,8 +193,10 @@ static void seader_start_snmp_probe(Seader* seader) {
         SeaderSamStateCapabilityPending,
         SeaderSamIntentMaintenance,
         SamCommand_PR_processSNMPMessage);
+    seader_trace(TAG, "snmp probe start stage=%s", seader_snmp_probe_stage_name(seader->snmp_probe.stage));
 
     if(!seader_snmp_probe_send_next_request(seader)) {
+        seader_trace(TAG, "snmp probe send-next failed stage=%s", seader_snmp_probe_stage_name(seader->snmp_probe.stage));
         seader->sam_key_probe_status = SeaderSamKeyProbeStatusProbeFailed;
         seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
         seader_update_sam_key_label(seader, NULL, 0U);
@@ -1102,8 +1109,17 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
         break;
     case SeaderSamStateCapabilityPending:
         SEADER_VERBOSE_I(TAG, "samResponse processSNMPMessage");
+        seader_trace(
+            TAG,
+            "snmp response stage=%s len=%u",
+            seader_snmp_probe_stage_name(seader->snmp_probe.stage),
+            (unsigned)samResponse->size);
         if(!seader_uhf_snmp_probe_consume_response(
                &seader->snmp_probe, samResponse->buf, samResponse->size)) {
+            seader_trace(
+                TAG,
+                "snmp response rejected stage=%s",
+                seader_snmp_probe_stage_name(seader->snmp_probe.stage));
             seader->sam_key_probe_status = SeaderSamKeyProbeStatusProbeFailed;
             seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
             seader_update_sam_key_label(seader, NULL, 0U);
@@ -1126,12 +1142,26 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
                 seader, seader->snmp_probe.ice_value_storage, seader->snmp_probe.ice_value_len);
             seader_update_uhf_status_label(seader);
         }
+        seader_trace(
+            TAG,
+            "snmp response advanced stage=%s ice_len=%u monza=%d higgs=%d monza_key=%d higgs_key=%d",
+            seader_snmp_probe_stage_name(seader->snmp_probe.stage),
+            (unsigned)seader->snmp_probe.ice_value_len,
+            seader->snmp_probe.has_monza4qt,
+            seader->snmp_probe.has_higgs3,
+            seader->snmp_probe.monza4qt_key_present,
+            seader->snmp_probe.higgs3_key_present);
 
         if(seader->snmp_probe.stage == SeaderUhfSnmpProbeStageDone) {
+            seader_trace(TAG, "snmp probe complete");
             seader_snmp_probe_finish(seader);
         } else if(
             seader->snmp_probe.stage == SeaderUhfSnmpProbeStageFailed ||
             !seader_snmp_probe_send_next_request(seader)) {
+            seader_trace(
+                TAG,
+                "snmp probe failed/blocked stage=%s",
+                seader_snmp_probe_stage_name(seader->snmp_probe.stage));
             seader->sam_key_probe_status = SeaderSamKeyProbeStatusProbeFailed;
             seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
             seader_update_sam_key_label(seader, NULL, 0U);
@@ -1708,6 +1738,14 @@ bool seader_worker_state_machine(
         if(seader->sam_state == SeaderSamStateCapabilityPending) {
             ErrorResponse_t* err = &payload->choice.errorResponse;
             SeaderUhfSnmpProbeStage previous_stage = seader->snmp_probe.stage;
+            seader_trace(
+                TAG,
+                "snmp error stage=%s code=0x%02lx data_len=%u b0=%02x b1=%02x",
+                seader_snmp_probe_stage_name(previous_stage),
+                (unsigned long)err->errorCode,
+                (unsigned)err->data.size,
+                err->data.size > 0U ? err->data.buf[0] : 0U,
+                err->data.size > 1U ? err->data.buf[1] : 0U);
             if(seader_uhf_snmp_probe_consume_error(
                    &seader->snmp_probe, err->errorCode, err->data.buf, err->data.size)) {
                 SEADER_VERBOSE_I(
@@ -1734,8 +1772,13 @@ bool seader_worker_state_machine(
                     seader->snmp_probe.ice_value_len);
                 seader_update_uhf_status_label(seader);
                 if(seader->snmp_probe.stage == SeaderUhfSnmpProbeStageDone) {
+                    seader_trace(TAG, "snmp error advanced to done");
                     seader_snmp_probe_finish(seader);
                 } else if(!seader_snmp_probe_send_next_request(seader)) {
+                    seader_trace(
+                        TAG,
+                        "snmp error advanced but send-next failed stage=%s",
+                        seader_snmp_probe_stage_name(seader->snmp_probe.stage));
                     seader->sam_key_probe_status = SeaderSamKeyProbeStatusProbeFailed;
                     seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
                     seader_update_sam_key_label(seader, NULL, 0U);
@@ -1743,6 +1786,10 @@ bool seader_worker_state_machine(
                     seader_snmp_probe_finish(seader);
                 }
             } else {
+                seader_trace(
+                    TAG,
+                    "snmp error unhandled stage=%s",
+                    seader_snmp_probe_stage_name(seader->snmp_probe.stage));
                 FURI_LOG_W(
                     TAG,
                     "SNMP probe unhandled error stage=%s code=0x%02lx data=%02x%02x len=%zu",

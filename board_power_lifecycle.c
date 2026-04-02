@@ -2,11 +2,43 @@
 
 #define SEADER_BOARD_POWER_AVAILABLE_MV 4500U
 
-SeaderBoardPowerAcquirePlan seader_board_power_plan_acquire(bool otg_already_enabled) {
-    SeaderBoardPowerAcquirePlan plan = {
-        .should_enable_otg = !otg_already_enabled,
-        .owns_otg = !otg_already_enabled,
-    };
+SeaderBoardAttachment seader_board_attachment_classify(bool pa4_high, bool pc1_high, bool pc0_high) {
+    if(pa4_high) {
+        return SeaderBoardAttachmentUhfCarrier;
+    }
+
+    if(pc1_high || pc0_high) {
+        return SeaderBoardAttachmentSamOnly;
+    }
+
+    return SeaderBoardAttachmentUnknownOrNone;
+}
+
+const char* seader_board_attachment_label(SeaderBoardAttachment attachment) {
+    switch(attachment) {
+    case SeaderBoardAttachmentSamOnly:
+        return "sam-only";
+    case SeaderBoardAttachmentUhfCarrier:
+        return "uhf-carrier";
+    case SeaderBoardAttachmentUnknownOrNone:
+    default:
+        return "unknown-or-none";
+    }
+}
+
+SeaderBoardPowerAcquirePlan
+    seader_board_power_plan_acquire(SeaderBoardAttachment attachment, bool otg_already_enabled) {
+    SeaderBoardPowerAcquirePlan plan = {0};
+
+    if(attachment == SeaderBoardAttachmentSamOnly) {
+        plan.should_assert_enable = true;
+    } else if(attachment == SeaderBoardAttachmentUhfCarrier) {
+        plan.should_enable_otg = !otg_already_enabled;
+        plan.owns_otg = !otg_already_enabled;
+        plan.should_assert_enable = true;
+        plan.should_validate_power = true;
+        plan.should_monitor_runtime = true;
+    }
 
     return plan;
 }

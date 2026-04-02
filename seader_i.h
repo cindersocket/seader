@@ -139,8 +139,10 @@ typedef enum {
 } SeaderSamIntent;
 
 struct Seader {
+    SeaderBoardAttachment board_attachment;
     bool board_power_enabled;
     bool board_power_owned;
+    bool board_power_monitor_active;
     bool expansion_disabled;
     SeaderBoardStatus board_status;
     SeaderStartupStage startup_stage;

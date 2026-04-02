@@ -9,6 +9,7 @@
 #define SEADER_PLUGIN_DIR                         APP_ASSETS_PATH("plugins")
 #define SEADER_WIEGAND_PLUGIN_PATH                APP_ASSETS_PATH("plugins/plugin_wiegand.fal")
 #define SEADER_HF_PLUGIN_PATH                     APP_ASSETS_PATH("plugins/plugin_hf.fal")
+#define SEADER_BOARD_PROBE_SETTLE_MS              2U
 #define SEADER_BOARD_POWER_SETTLE_MS              250U
 #define SEADER_BOARD_ENABLE_SETTLE_MS             150U
 #define SEADER_BOARD_RETRY_COOLDOWN_MS            100U
@@ -208,6 +209,7 @@ static bool seader_board_handle_runtime_power_lost(Seader* seader) {
     FURI_LOG_W(TAG, "Runtime board power lost");
     seader_board_runtime_clear_loss_pending(seader);
     seader->board_power_enabled = false;
+    seader->board_power_monitor_active = false;
     seader_show_loading_popup(seader, false);
     seader_board_prepare_missing_state(seader, SeaderBoardStatusPowerLost);
     seader_hf_read_fail(seader, SeaderHfReadFailureReasonBoardMissing);
@@ -273,9 +275,34 @@ static uint16_t seader_board_vbus_mv_from_volts(float vbus_voltage) {
     return (uint16_t)scaled_mv;
 }
 
+static bool seader_board_probe_pin_pulldown_high(const GpioPin* pin) {
+    if(!pin) {
+        return false;
+    }
+
+    furi_hal_gpio_init(pin, GpioModeInput, GpioPullDown, GpioSpeedLow);
+    furi_delay_ms(SEADER_BOARD_PROBE_SETTLE_MS);
+    const bool is_high = furi_hal_gpio_read(pin);
+    furi_hal_gpio_init(pin, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
+    return is_high;
+}
+
+static SeaderBoardAttachment seader_board_detect_attachment(void) {
+    const bool pa4_high = seader_board_probe_pin_pulldown_high(&gpio_ext_pa4);
+    bool pc1_high = false;
+    bool pc0_high = false;
+
+    if(!pa4_high) {
+        pc1_high = seader_board_probe_pin_pulldown_high(&gpio_ext_pc1);
+        pc0_high = seader_board_probe_pin_pulldown_high(&gpio_ext_pc0);
+    }
+
+    return seader_board_attachment_classify(pa4_high, pc1_high, pc0_high);
+}
+
 static void seader_board_runtime_monitor_tick(Seader* seader) {
     if(!seader || !seader->power || !seader->board_power_enabled ||
-       seader->board_status == SeaderBoardStatusPowerLost) {
+       !seader->board_power_monitor_active || seader->board_status == SeaderBoardStatusPowerLost) {
         return;
     }
 
@@ -384,6 +411,7 @@ static void seader_board_power_fail(Seader* seader, SeaderBoardStatus status) {
     }
     seader->board_power_enabled = false;
     seader->board_power_owned = false;
+    seader->board_power_monitor_active = false;
     seader->board_status = status;
 }
 
@@ -398,17 +426,53 @@ static bool seader_board_power_on(Seader* seader) {
     }
 
     seader_board_prepare_external_bus(seader);
+    seader->board_attachment = seader_board_detect_attachment();
 
     const bool otg_already_enabled = furi_hal_power_is_otg_enabled();
-    const SeaderBoardPowerAcquirePlan plan = seader_board_power_plan_acquire(otg_already_enabled);
+    const SeaderBoardPowerAcquirePlan plan =
+        seader_board_power_plan_acquire(seader->board_attachment, otg_already_enabled);
+
+    FURI_LOG_I(
+        TAG,
+        "Board attachment=%s plan(otg=%d enable=%d validate=%d monitor=%d)",
+        seader_board_attachment_label(seader->board_attachment),
+        plan.should_enable_otg,
+        plan.should_assert_enable,
+        plan.should_validate_power,
+        plan.should_monitor_runtime);
+    seader_trace(
+        TAG,
+        "board attachment=%s plan otg=%d enable=%d validate=%d monitor=%d",
+        seader_board_attachment_label(seader->board_attachment),
+        plan.should_enable_otg,
+        plan.should_assert_enable,
+        plan.should_validate_power,
+        plan.should_monitor_runtime);
 
     seader_board_set_enable_pin(false);
+    seader->board_power_owned = false;
+    seader->board_power_monitor_active = false;
+    if(!plan.should_assert_enable) {
+        seader->board_power_enabled = false;
+        seader->board_status = SeaderBoardStatusUnknown;
+        seader_trace(TAG, "board power skipped");
+        return true;
+    }
+
     if(plan.should_enable_otg) {
         if(!seader->power) {
             seader->board_status = SeaderBoardStatusFaultPreEnable;
             return false;
         }
         power_enable_otg(seader->power, true);
+    }
+
+    if(!plan.should_validate_power) {
+        seader_board_set_enable_pin(true);
+        seader->board_power_enabled = true;
+        seader->board_status = SeaderBoardStatusPowerReadyPendingValidation;
+        seader_trace(TAG, "board enable-only path active");
+        return true;
     }
 
     furi_delay_ms(SEADER_BOARD_POWER_SETTLE_MS);
@@ -444,6 +508,7 @@ static bool seader_board_power_on(Seader* seader) {
         return false;
     }
     seader->board_power_enabled = true;
+    seader->board_power_monitor_active = plan.should_monitor_runtime;
     seader->board_status = SeaderBoardStatusPowerReadyPendingValidation;
     return true;
 }
@@ -460,6 +525,7 @@ static void seader_board_power_off(Seader* seader) {
     }
     seader->board_power_enabled = false;
     seader->board_power_owned = false;
+    seader->board_power_monitor_active = false;
 }
 
 bool seader_board_retry_power_cycle(Seader* seader) {
@@ -927,8 +993,10 @@ Seader* seader_alloc() {
     Seader* seader = malloc(sizeof(Seader));
     seader_trace_reset();
 
+    seader->board_attachment = SeaderBoardAttachmentUnknownOrNone;
     seader->board_power_enabled = false;
     seader->board_power_owned = false;
+    seader->board_power_monitor_active = false;
     seader->expansion_disabled = false;
     seader->board_status = SeaderBoardStatusUnknown;
     seader->startup_stage = SeaderStartupStageNone;
