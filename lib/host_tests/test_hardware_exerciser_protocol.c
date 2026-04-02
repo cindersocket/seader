@@ -154,17 +154,17 @@ static MunitResult test_build_hf14a_scan_payload_with_ats(const MunitParameter p
     (void)params;
     (void)fixture;
 
-    /* Scan payload includes UID, ATQA, SAK, and optional ATS bytes in compact wire order. */
+    /* Scan payload includes UID, ATQA, SAK, and a complete ATS blob including TL. */
     const uint8_t uid[] = {0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6};
     const uint8_t atqa[] = {0x44, 0x00};
-    const uint8_t ats[] = {0x75, 0x77, 0x81, 0x02};
+    const uint8_t ats[] = {0x05, 0x75, 0x77, 0x81, 0x02};
     uint8_t out[32] = {0};
 
     const size_t len =
         hx_build_hf14a_scan_payload(uid, sizeof(uid), atqa, 0x20, ats, sizeof(ats), out, sizeof(out));
 
     const uint8_t expected[] = {
-        0x07, 0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x44, 0x00, 0x20, 0x04, 0x75, 0x77, 0x81, 0x02};
+        0x07, 0x04, 0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x44, 0x00, 0x20, 0x05, 0x05, 0x75, 0x77, 0x81, 0x02};
     munit_assert_size(len, ==, sizeof(expected));
     munit_assert_memory_equal(sizeof(expected), out, expected);
     return MUNIT_OK;

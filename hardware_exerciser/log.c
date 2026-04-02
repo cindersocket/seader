@@ -5,6 +5,7 @@
 
 #define HE_LOG_TAG "HETrace"
 
+#if HE_DEBUG_TRACE
 static void he_log_write_line(const char* line, FS_OpenMode open_mode) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     storage_simply_mkdir(storage, STORAGE_APP_DATA_PATH_PREFIX);
@@ -46,3 +47,4 @@ void he_log_tag(const char* tag, const char* fmt, ...) {
     he_log_vwrite(tag, fmt, args);
     va_end(args);
 }
+#endif

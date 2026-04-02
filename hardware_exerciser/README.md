@@ -90,7 +90,7 @@ Response payload body layout is:
 | `0x45` | `GpioVectorCapture` | `write_count`, writes, `settle_us_le32`, `sample_count`, samples | `sample_count`, then repeated `pin_number`, `sample_kind`, `value_le16`, `aux_le16` |
 | `0x46` | `GpioReset` | None | Empty success response |
 | `0x7e` | `Quit` | None | Empty success response |
-| `0x7f` | `Abort` | None | Empty success response |
+| `0x7f` | `Abort` | None | Empty body with `Unsupported` status |
 
 ## Status Codes
 
