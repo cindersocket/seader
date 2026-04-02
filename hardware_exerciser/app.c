@@ -126,6 +126,7 @@ typedef enum {
     HeDiagSerialRelease,
     HeDiagCdcReceive,
     HeDiagCdcReceiveError,
+    HeDiagCdcRxBatch,
     HeDiagCdcSend,
     HeDiagCdcSendSkipped,
     HeDiagFrameState,
@@ -355,6 +356,8 @@ static const char* he_diag_code_label(HeDiagCode code) {
         return "cdc_recv";
     case HeDiagCdcReceiveError:
         return "cdc_recv_err";
+    case HeDiagCdcRxBatch:
+        return "cdc_rx_batch";
     case HeDiagCdcSend:
         return "cdc_send";
     case HeDiagCdcSendSkipped:
@@ -732,6 +735,11 @@ static void he_bridge_vcp_rx(void* context) {
         he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 2, bridge ? bridge->lifecycle : 0);
         return;
     }
+    /*
+     * USB wake/suspend state is not a reliable proxy for "a host is actively talking to this CDC
+     * port". A successful RX callback proves the session is live enough to answer.
+     */
+    bridge->cdc_connected = true;
     he_diag_record(
         bridge->app,
         bridge->vcp_ch,
@@ -783,7 +791,7 @@ static const CdcCallbacks he_bridge_cdc_callbacks = {
 };
 
 static bool he_bridge_send_cdc(HeBridge* bridge, const uint8_t* data, size_t len) {
-    if(!he_bridge_is_running(bridge) || !bridge->cdc_connected || len == 0U) {
+    if(!he_bridge_is_running(bridge) || len == 0U) {
         he_diag_record(
             bridge ? bridge->app : NULL,
             bridge ? bridge->vcp_ch : 0xffU,
@@ -798,25 +806,34 @@ static bool he_bridge_send_cdc(HeBridge* bridge, const uint8_t* data, size_t len
         return false;
     }
 
-    /* The Flipper CDC API is asynchronous; use a semaphore so only one transfer is in flight. */
-    if(furi_semaphore_acquire(bridge->tx_sem, HE_WAIT_TIMEOUT_MS) != FuriStatusOk) {
-        return false;
+    size_t offset = 0U;
+    while(offset < len) {
+        /* The Flipper CDC API is asynchronous; use a semaphore so only one packet is in flight. */
+        if(furi_semaphore_acquire(bridge->tx_sem, HE_WAIT_TIMEOUT_MS) != FuriStatusOk) {
+            return false;
+        }
+
+        const size_t remaining = len - offset;
+        const size_t chunk_len = remaining > (size_t)CDC_DATA_SZ ? (size_t)CDC_DATA_SZ : remaining;
+
+        /* Both bridges share the USB device, so guard callback registration and endpoint access. */
+        if(!he_usb_lock(bridge)) {
+            he_bridge_release_tx_slot(bridge);
+            return false;
+        }
+
+        memcpy(bridge->cdc_tx_buf, data + offset, chunk_len);
+        bridge->cdc_tx_len = chunk_len;
+        bridge->cdc_tx_in_flight = true;
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcSend, chunk_len, (int32_t)offset);
+        furi_hal_cdc_send(bridge->vcp_ch, bridge->cdc_tx_buf, chunk_len);
+        if(!he_usb_unlock(bridge)) {
+            return false;
+        }
+
+        offset += chunk_len;
     }
 
-    /* Both bridges share the USB device, so guard callback registration and endpoint access. */
-    if(!he_usb_lock(bridge)) {
-        he_bridge_release_tx_slot(bridge);
-        return false;
-    }
-
-    memcpy(bridge->cdc_tx_buf, data, len);
-    bridge->cdc_tx_len = len;
-    bridge->cdc_tx_in_flight = true;
-    he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcSend, len, 0);
-    furi_hal_cdc_send(bridge->vcp_ch, bridge->cdc_tx_buf, len);
-    if(!he_usb_unlock(bridge)) {
-        return false;
-    }
     return true;
 }
 
@@ -1591,88 +1608,35 @@ static bool he_bridge_handle_escape_frame(HeBridge* bridge, const uint8_t* frame
            he_bridge_send_cdc(bridge, sam_protocol->escape_response_frame, frame_size);
 }
 
-static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
+static void he_bridge_parse_sam_cdc_accum(HeBridge* bridge) {
     HeSamProtocolContext* sam_protocol = he_bridge_sam_protocol(bridge);
-    if(!he_bridge_is_running(bridge)) {
-        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 3, bridge ? bridge->lifecycle : 0);
+    if(!bridge || !sam_protocol) {
         return;
     }
 
-    while(1) {
-        size_t received = 0U;
+    while(sam_protocol->cdc_accum_len > 0U) {
+        size_t frame_len = 0U;
+        const HxFrameState state =
+            hx_ccid_frame_state(
+                sam_protocol->cdc_accum,
+                sam_protocol->cdc_accum_len,
+                sizeof(sam_protocol->cdc_accum),
+                &frame_len);
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagFrameState, state, frame_len);
 
-        if(bridge->mode == HeBridgeModeUhfRaw) {
-            if(!he_usb_lock(bridge)) {
-                return;
-            }
-            const int32_t len =
-                furi_hal_cdc_receive(bridge->vcp_ch, bridge->uart_rx_buf, sizeof(bridge->uart_rx_buf));
-            he_usb_unlock(bridge);
-            if(len <= 0) {
-                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceiveError, len, 0);
-                break;
-            }
-            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceive, len, 0);
-            /* CDC1 never parses frames; every byte goes straight to the UHF UART. */
-            he_bridge_forward_frame_to_uart(bridge, bridge->uart_rx_buf, (size_t)len);
+        if(state == HxFrameStateDesync || state == HxFrameStateInvalidLength) {
+            /* Resynchronize one byte at a time until the framing preamble is found again. */
+            memmove(
+                sam_protocol->cdc_accum,
+                sam_protocol->cdc_accum + 1U,
+                sam_protocol->cdc_accum_len - 1U);
+            sam_protocol->cdc_accum_len--;
             continue;
         }
 
-        if(!sam_protocol) {
-            break;
-        }
-
-        /* Pull as much host data as is currently available into the SAM accumulation buffer. */
-        while(sam_protocol->cdc_accum_len < sizeof(sam_protocol->cdc_accum)) {
-            const size_t remaining = sizeof(sam_protocol->cdc_accum) - sam_protocol->cdc_accum_len;
-            const size_t request_size = remaining > CDC_DATA_SZ ? CDC_DATA_SZ : remaining;
-
-            if(!he_usb_lock(bridge)) {
-                return;
-            }
-            const int32_t len = furi_hal_cdc_receive(
-                bridge->vcp_ch, sam_protocol->cdc_accum + sam_protocol->cdc_accum_len, request_size);
-            he_usb_unlock(bridge);
-            if(len <= 0) {
-                he_diag_record(
-                    bridge->app,
-                    bridge->vcp_ch,
-                    HeDiagCdcReceiveError,
-                    len,
-                    sam_protocol->cdc_accum_len);
-            } else {
-                he_diag_record(
-                    bridge->app,
-                    bridge->vcp_ch,
-                    HeDiagCdcReceive,
-                    len,
-                    sam_protocol->cdc_accum_len);
-            }
-
-            if(len <= 0) {
-                break;
-            }
-
-            sam_protocol->cdc_accum_len += (size_t)len;
-            received += (size_t)len;
-        }
-
-        if(received == 0U && sam_protocol->cdc_accum_len == 0U) {
-            break;
-        }
-
-        while(sam_protocol->cdc_accum_len > 0U) {
-            size_t frame_len = 0U;
-            const HxFrameState state =
-                hx_ccid_frame_state(
-                    sam_protocol->cdc_accum,
-                    sam_protocol->cdc_accum_len,
-                    sizeof(sam_protocol->cdc_accum),
-                    &frame_len);
-            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagFrameState, state, frame_len);
-
-            if(state == HxFrameStateDesync || state == HxFrameStateInvalidLength) {
-                /* Resynchronize one byte at a time until the framing preamble is found again. */
+        if(state == HxFrameStateNeedMore) {
+            if(sam_protocol->cdc_accum_len == sizeof(sam_protocol->cdc_accum)) {
+                /* Full buffer with no complete frame means the oldest byte cannot be trusted. */
                 memmove(
                     sam_protocol->cdc_accum,
                     sam_protocol->cdc_accum + 1U,
@@ -1680,41 +1644,115 @@ static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
                 sam_protocol->cdc_accum_len--;
                 continue;
             }
-
-            if(state == HxFrameStateNeedMore) {
-                if(sam_protocol->cdc_accum_len == sizeof(sam_protocol->cdc_accum)) {
-                    /* Full buffer with no complete frame means the oldest byte cannot be trusted. */
-                    memmove(
-                        sam_protocol->cdc_accum,
-                        sam_protocol->cdc_accum + 1U,
-                        sam_protocol->cdc_accum_len - 1U);
-                    sam_protocol->cdc_accum_len--;
-                    continue;
-                }
-                break;
-            }
-
-            if(hx_ccid_is_escape_frame(sam_protocol->cdc_accum, frame_len)) {
-                /* Escape frames terminate locally and become HX protocol operations. */
-                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagEscapeDispatch, frame_len, 0);
-                he_bridge_handle_escape_frame(bridge, sam_protocol->cdc_accum, frame_len);
-            } else {
-                /* Ordinary CCID traffic is transparent and continues to the SAM UART. */
-                he_diag_record(bridge->app, bridge->vcp_ch, HeDiagNonEscapeForward, frame_len, 0);
-                he_bridge_forward_frame_to_uart(bridge, sam_protocol->cdc_accum, frame_len);
-            }
-
-            memmove(
-                sam_protocol->cdc_accum,
-                sam_protocol->cdc_accum + frame_len,
-                sam_protocol->cdc_accum_len - frame_len);
-            sam_protocol->cdc_accum_len -= frame_len;
-        }
-
-        if(received == 0U) {
             break;
         }
+
+        if(hx_ccid_is_escape_frame(sam_protocol->cdc_accum, frame_len)) {
+            /* Escape frames terminate locally and become HX protocol operations. */
+            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagEscapeDispatch, frame_len, 0);
+            he_bridge_handle_escape_frame(bridge, sam_protocol->cdc_accum, frame_len);
+        } else {
+            /* Ordinary CCID traffic is transparent and continues to the SAM UART. */
+            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagNonEscapeForward, frame_len, 0);
+            he_bridge_forward_frame_to_uart(bridge, sam_protocol->cdc_accum, frame_len);
+        }
+
+        memmove(
+            sam_protocol->cdc_accum,
+            sam_protocol->cdc_accum + frame_len,
+            sam_protocol->cdc_accum_len - frame_len);
+        sam_protocol->cdc_accum_len -= frame_len;
     }
+}
+
+static void he_bridge_maybe_resignal_cdc_rx(
+    HeBridge* bridge,
+    size_t received,
+    size_t request_size) {
+    const bool should_resignal =
+        (received == CDC_DATA_SZ) && (request_size == CDC_DATA_SZ) && bridge->cdc_connected &&
+        he_bridge_is_running(bridge);
+    he_diag_record(
+        bridge ? bridge->app : NULL,
+        bridge ? bridge->vcp_ch : 0xffU,
+        HeDiagCdcRxBatch,
+        (int32_t)received,
+        should_resignal ? 1 : 0);
+    if(should_resignal) {
+        he_bridge_signal_worker(bridge, HeWorkerEvtCdcRx);
+    }
+}
+
+static void he_bridge_handle_cdc_rx(HeBridge* bridge) {
+    HeSamProtocolContext* sam_protocol = he_bridge_sam_protocol(bridge);
+    if(!he_bridge_is_running(bridge)) {
+        he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagCallbackIgnored, 3, bridge ? bridge->lifecycle : 0);
+        return;
+    }
+
+    if(bridge->mode == HeBridgeModeUhfRaw) {
+        const size_t request_size = sizeof(bridge->uart_rx_buf);
+        if(!he_usb_lock(bridge)) {
+            return;
+        }
+        const int32_t len =
+            furi_hal_cdc_receive(bridge->vcp_ch, bridge->uart_rx_buf, request_size);
+        he_usb_unlock(bridge);
+        if(len <= 0) {
+            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceiveError, len, 0);
+            he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcRxBatch, 0, 0);
+            return;
+        }
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcReceive, len, 0);
+        /* CDC1 never parses frames; every byte goes straight to the UHF UART. */
+        he_bridge_forward_frame_to_uart(bridge, bridge->uart_rx_buf, (size_t)len);
+        he_bridge_maybe_resignal_cdc_rx(bridge, (size_t)len, request_size);
+        return;
+    }
+
+    if(!sam_protocol) {
+        return;
+    }
+
+    /*
+     * Each worker wakeup owns at most one USB packet. Returning to the event loop between packets
+     * lets disconnect/session-reset events run before another blocking receive is attempted.
+     */
+    he_bridge_parse_sam_cdc_accum(bridge);
+
+    const size_t remaining = sizeof(sam_protocol->cdc_accum) - sam_protocol->cdc_accum_len;
+    if(remaining == 0U) {
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcRxBatch, -1, 0);
+        return;
+    }
+
+    const size_t request_size = remaining > CDC_DATA_SZ ? CDC_DATA_SZ : remaining;
+    if(!he_usb_lock(bridge)) {
+        return;
+    }
+    const int32_t len = furi_hal_cdc_receive(
+        bridge->vcp_ch, sam_protocol->cdc_accum + sam_protocol->cdc_accum_len, request_size);
+    he_usb_unlock(bridge);
+    if(len <= 0) {
+        he_diag_record(
+            bridge->app,
+            bridge->vcp_ch,
+            HeDiagCdcReceiveError,
+            len,
+            sam_protocol->cdc_accum_len);
+        he_diag_record(bridge->app, bridge->vcp_ch, HeDiagCdcRxBatch, 0, 0);
+        return;
+    }
+
+    he_diag_record(
+        bridge->app,
+        bridge->vcp_ch,
+        HeDiagCdcReceive,
+        len,
+        sam_protocol->cdc_accum_len);
+    sam_protocol->cdc_accum_len += (size_t)len;
+    he_bridge_parse_sam_cdc_accum(bridge);
+    he_bridge_maybe_resignal_cdc_rx(bridge, (size_t)len, request_size);
 }
 
 static int32_t he_bridge_worker(void* context) {
