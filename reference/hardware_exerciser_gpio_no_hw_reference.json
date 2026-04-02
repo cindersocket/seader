@@ -1,0 +1,116 @@
+{
+  "captured_at": "2026-04-01T20:59:00-07:00",
+  "device": "Flipper Zero",
+  "app": "hardware_exerciser",
+  "conditions": {
+    "uhf_attached": false,
+    "nfc_target_present": false,
+    "samadams_attached": false,
+    "notes": "No external fixture attached. Captured over HardwareExerciser CDC0."
+  },
+  "pins": [
+    {
+      "pin": 2,
+      "name": "PA7",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 3,
+      "name": "PA6",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 4,
+      "name": "PA4",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 5,
+      "name": "PB3",
+      "digital": true,
+      "analog": false
+    },
+    {
+      "pin": 6,
+      "name": "PB2",
+      "digital": true,
+      "analog": false
+    },
+    {
+      "pin": 7,
+      "name": "PC3",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 15,
+      "name": "PC1",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 16,
+      "name": "PC0",
+      "digital": true,
+      "analog": true
+    }
+  ],
+  "digital_none": [
+    [0, 0, 0, 0, 1, 1, 1, 1],
+    [0, 0, 0, 0, 1, 1, 1, 1],
+    [0, 0, 0, 0, 1, 1, 1, 1]
+  ],
+  "digital_pull_up": [1, 1, 1, 1, 1, 1, 1, 1],
+  "digital_pull_down": [0, 0, 0, 0, 0, 0, 0, 0],
+  "analog_idle": [
+    {
+      "pin_order": [2, 3, 4, 7, 15, 16],
+      "samples": [
+        {"raw": 208, "mv": 104},
+        {"raw": 207, "mv": 103},
+        {"raw": 206, "mv": 103},
+        {"raw": 178, "mv": 89},
+        {"raw": 177, "mv": 88},
+        {"raw": 178, "mv": 89}
+      ]
+    },
+    {
+      "pin_order": [2, 3, 4, 7, 15, 16],
+      "samples": [
+        {"raw": 209, "mv": 104},
+        {"raw": 207, "mv": 103},
+        {"raw": 207, "mv": 103},
+        {"raw": 177, "mv": 88},
+        {"raw": 177, "mv": 88},
+        {"raw": 178, "mv": 89}
+      ]
+    },
+    {
+      "pin_order": [2, 3, 4, 7, 15, 16],
+      "samples": [
+        {"raw": 208, "mv": 104},
+        {"raw": 207, "mv": 103},
+        {"raw": 207, "mv": 103},
+        {"raw": 177, "mv": 88},
+        {"raw": 176, "mv": 88},
+        {"raw": 178, "mv": 89}
+      ]
+    }
+  ],
+  "one_hot_high": {
+    "pin_order": [2, 3, 4, 5, 6, 7, 15, 16],
+    "vectors": {
+      "2": [1, 0, 0, 0, 0, 0, 0, 0],
+      "3": [0, 1, 0, 0, 0, 0, 0, 0],
+      "4": [0, 0, 1, 0, 0, 0, 0, 0],
+      "5": [0, 0, 0, 1, 0, 0, 0, 0],
+      "6": [0, 0, 0, 0, 1, 0, 0, 0],
+      "7": [0, 0, 0, 0, 0, 1, 0, 0],
+      "15": [0, 0, 0, 0, 0, 0, 1, 0],
+      "16": [0, 0, 0, 0, 0, 0, 0, 1]
+    }
+  }
+}

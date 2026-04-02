@@ -1,0 +1,260 @@
+{
+  "captured_at": "2026-04-01T21:18:57-07:00",
+  "device": "Flipper Zero",
+  "app": "hardware_exerciser",
+  "conditions": {
+    "carrier": "Flippermeister",
+    "uhf_module": "v1",
+    "nfc_target_present": false,
+    "samadams_attached": false,
+    "notes": "Captured over HardwareExerciser CDC0 with Flippermeister carrier and v1 UHF module attached."
+  },
+  "pins": [
+    {
+      "pin": 2,
+      "name": "PA7",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 3,
+      "name": "PA6",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 4,
+      "name": "PA4",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 5,
+      "name": "PB3",
+      "digital": true,
+      "analog": false
+    },
+    {
+      "pin": 6,
+      "name": "PB2",
+      "digital": true,
+      "analog": false
+    },
+    {
+      "pin": 7,
+      "name": "PC3",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 15,
+      "name": "PC1",
+      "digital": true,
+      "analog": true
+    },
+    {
+      "pin": 16,
+      "name": "PC0",
+      "digital": true,
+      "analog": true
+    }
+  ],
+  "digital_none": [
+    [
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1
+    ],
+    [
+      0,
+      0,
+      1,
+      0,
+      1,
+      1,
+      1,
+      1
+    ]
+  ],
+  "digital_pull_up": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "digital_pull_down": [
+    0,
+    0,
+    1,
+    0,
+    0,
+    0,
+    0,
+    1
+  ],
+  "analog_idle": [
+    {
+      "pin_order": [
+        2,
+        3,
+        4,
+        7,
+        15,
+        16
+      ],
+      "samples": [
+        {
+          "raw": 236,
+          "mv": 118
+        },
+        {
+          "raw": 222,
+          "mv": 111
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 188,
+          "mv": 94
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        }
+      ]
+    },
+    {
+      "pin_order": [
+        2,
+        3,
+        4,
+        7,
+        15,
+        16
+      ],
+      "samples": [
+        {
+          "raw": 235,
+          "mv": 117
+        },
+        {
+          "raw": 223,
+          "mv": 111
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 189,
+          "mv": 94
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        }
+      ]
+    },
+    {
+      "pin_order": [
+        2,
+        3,
+        4,
+        7,
+        15,
+        16
+      ],
+      "samples": [
+        {
+          "raw": 235,
+          "mv": 117
+        },
+        {
+          "raw": 223,
+          "mv": 111
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 189,
+          "mv": 94
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        },
+        {
+          "raw": 4095,
+          "mv": 2048
+        }
+      ]
+    }
+  ],
+  "analysis_vs_empty": {
+    "digital_none_changed": [
+      2
+    ],
+    "digital_pull_up_changed": [],
+    "digital_pull_down_changed": [
+      2,
+      7
+    ],
+    "analog_delta_mv_first_run": [
+      {
+        "pin": 2,
+        "delta_mv": 14
+      },
+      {
+        "pin": 3,
+        "delta_mv": 8
+      },
+      {
+        "pin": 4,
+        "delta_mv": 1945
+      },
+      {
+        "pin": 7,
+        "delta_mv": 5
+      },
+      {
+        "pin": 15,
+        "delta_mv": 1960
+      },
+      {
+        "pin": 16,
+        "delta_mv": 1959
+      }
+    ]
+  }
+}
