@@ -20,3 +20,8 @@ void seader_sam_key_label_format(
     size_t elite_ice_value_len,
     char* out,
     size_t out_size);
+
+bool seader_sam_key_is_ice1803(
+    SeaderSamKeyProbeStatus probe_status,
+    const uint8_t* elite_ice_value,
+    size_t elite_ice_value_len);

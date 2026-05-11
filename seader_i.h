@@ -172,6 +172,8 @@ struct Seader {
     size_t ATR_len;
     SeaderSamKeyProbeStatus sam_key_probe_status;
     SeaderUhfProbeStatus uhf_probe_status;
+    uint8_t sam_ice_value_storage[SEADER_UHF_SNMP_MAX_VALUE_LEN];
+    size_t sam_ice_value_len;
     char sam_key_label[SEADER_SAM_KEY_LABEL_MAX_LEN];
     char uhf_status_label[SEADER_UHF_STATUS_LABEL_MAX_LEN];
     SeaderUhfSnmpProbe snmp_probe;

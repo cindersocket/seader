@@ -97,6 +97,27 @@ static MunitResult test_sanitizes_non_printable_bytes(const MunitParameter param
     return MUNIT_OK;
 }
 
+static MunitResult test_detects_ice1803_key(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+    const uint8_t ice[] = {'I', 'C', 'E', '1', '8', '0', '3'};
+    const uint8_t other[] = {'I', 'C', 'E', '1', '8', '0', '4'};
+    const uint8_t zero64[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+    munit_assert_true(
+        seader_sam_key_is_ice1803(SeaderSamKeyProbeStatusVerifiedValue, ice, sizeof(ice)));
+    munit_assert_false(
+        seader_sam_key_is_ice1803(SeaderSamKeyProbeStatusVerifiedValue, other, sizeof(other)));
+    munit_assert_false(
+        seader_sam_key_is_ice1803(
+            SeaderSamKeyProbeStatusVerifiedStandard, zero64, sizeof(zero64)));
+    munit_assert_false(
+        seader_sam_key_is_ice1803(SeaderSamKeyProbeStatusProbeFailed, ice, sizeof(ice)));
+    munit_assert_false(
+        seader_sam_key_is_ice1803(SeaderSamKeyProbeStatusVerifiedValue, NULL, 0U));
+    return MUNIT_OK;
+}
+
 static MunitTest test_sam_key_label_cases[] = {
     {(char*)"/no-sam", test_formats_no_sam, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/unknown", test_formats_unknown_for_missing_value, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
@@ -104,6 +125,7 @@ static MunitTest test_sam_key_label_cases[] = {
     {(char*)"/probe-failed", test_probe_failure_never_formats_standard, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/ascii", test_formats_ascii_ice_value, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {(char*)"/sanitize", test_sanitizes_non_printable_bytes, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/detect-ice1803", test_detects_ice1803_key, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
     {NULL, NULL, NULL, NULL, 0, NULL},
 };
 

@@ -2,6 +2,11 @@
 #include "seader_scene_read_common.h"
 #include <dolphin/dolphin.h>
 
+static bool seader_scene_read_is_config_flow(const Seader* seader) {
+    return seader && seader->credential &&
+           seader->credential->type == SeaderCredentialTypeConfig;
+}
+
 void seader_scene_read_on_enter(void* context) {
     Seader* seader = context;
     seader_hf_mode_activate(seader);
@@ -43,10 +48,18 @@ bool seader_scene_read_on_event(void* context, SceneManagerEvent event) {
                 seader);
             consumed = true;
         } else if(event.event == SeaderCustomEventWorkerExit) {
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadCardSuccess);
+            scene_manager_next_scene(
+                seader->scene_manager,
+                seader_scene_read_is_config_flow(seader) ? SeaderSceneReadConfigCardSuccess :
+                                                           SeaderSceneReadCardSuccess);
             consumed = true;
         } else if(event.event == SeaderWorkerEventFail) {
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadCardSuccess);
+            if(seader_scene_read_is_config_flow(seader)) {
+                scene_manager_search_and_switch_to_previous_scene(
+                    seader->scene_manager, SeaderSceneSamPresent);
+            } else {
+                scene_manager_next_scene(seader->scene_manager, SeaderSceneReadCardSuccess);
+            }
             consumed = true;
         } else if(event.event == SeaderWorkerEventHfTeardownComplete) {
             consumed = seader_hf_finish_teardown_action(seader);
@@ -55,7 +68,10 @@ bool seader_scene_read_on_event(void* context, SceneManagerEvent event) {
             popup_set_header(popup, "DON'T\nMOVE", 68, 30, AlignLeft, AlignTop);
             consumed = true;
         } else if(event.event == SeaderWorkerEventSuccess) {
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadCardSuccess);
+            scene_manager_next_scene(
+                seader->scene_manager,
+                seader_scene_read_is_config_flow(seader) ? SeaderSceneReadConfigCardSuccess :
+                                                           SeaderSceneReadCardSuccess);
             consumed = true;
         } else if(event.event == SeaderWorkerEventSelectCardType) {
             scene_manager_next_scene(seader->scene_manager, SeaderSceneReadCardType);

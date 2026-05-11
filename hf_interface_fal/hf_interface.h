@@ -10,7 +10,7 @@
 #include <nfc/nfc_device.h>
 
 #define HF_PLUGIN_APP_ID      "plugin_hf"
-#define HF_PLUGIN_API_VERSION 1
+#define HF_PLUGIN_API_VERSION 2
 
 typedef enum {
     PluginHfStageCardDetect = 0,
@@ -56,6 +56,7 @@ typedef struct {
     void (*set_14a_sio)(void* host_ctx, const uint8_t* data, size_t len);
     Nfc* (*get_nfc)(void* host_ctx);
     NfcDevice* (*get_nfc_device)(void* host_ctx);
+    bool (*can_probe_config_card)(void* host_ctx);
 
     /* Required Picopass hooks. All Flippers expose Picopass through the HF host API. */
     bool (*picopass_detect)(void* host_ctx);

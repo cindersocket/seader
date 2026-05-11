@@ -3,7 +3,6 @@ enum SubmenuIndex {
     SubmenuIndexRead,
     SubmenuIndexSaved,
     SubmenuIndexAPDURunner,
-    SubmenuIndexReadConfigCard,
     SubmenuIndexSamInfo,
 };
 
@@ -19,15 +18,6 @@ static void seader_scene_sam_present_rebuild_menu(Seader* seader, uint32_t selec
         submenu, "Read HF", SubmenuIndexRead, seader_scene_sam_present_submenu_callback, seader);
     submenu_add_item(
         submenu, "Saved", SubmenuIndexSaved, seader_scene_sam_present_submenu_callback, seader);
-
-    if(seader->is_debug_enabled) {
-        submenu_add_item(
-            submenu,
-            "Read Config Card",
-            SubmenuIndexReadConfigCard,
-            seader_scene_sam_present_submenu_callback,
-            seader);
-    }
 
     if(apdu_log_check_presence(SEADER_APDU_RUNNER_FILE_NAME)) {
         submenu_add_item(
@@ -74,19 +64,13 @@ bool seader_scene_sam_present_on_event(void* context, SceneManagerEvent event) {
     if(event.type == SceneManagerEventTypeCustom) {
         if(seader->sam_present_menu_guard_active &&
            (event.event == SubmenuIndexRead || event.event == SubmenuIndexSaved ||
-            event.event == SubmenuIndexAPDURunner || event.event == SubmenuIndexReadConfigCard ||
-            event.event == SubmenuIndexSamInfo)) {
+            event.event == SubmenuIndexAPDURunner || event.event == SubmenuIndexSamInfo)) {
             seader->sam_present_menu_guard_active = false;
             consumed = true;
         } else if(event.event == SubmenuIndexRead) {
             scene_manager_set_scene_state(
                 seader->scene_manager, SeaderSceneSamPresent, event.event);
             scene_manager_next_scene(seader->scene_manager, SeaderSceneRead);
-            consumed = true;
-        } else if(event.event == SubmenuIndexReadConfigCard) {
-            scene_manager_set_scene_state(
-                seader->scene_manager, SeaderSceneSamPresent, SubmenuIndexReadConfigCard);
-            scene_manager_next_scene(seader->scene_manager, SeaderSceneReadConfigCard);
             consumed = true;
         } else if(event.event == SubmenuIndexSamInfo) {
             scene_manager_set_scene_state(

@@ -862,6 +862,14 @@ static void seader_hf_plugin_set_read_error(void* host_ctx, const char* text) {
     strlcpy(seader->read_error, text, sizeof(seader->read_error));
 }
 
+static bool seader_hf_plugin_can_probe_config_card(void* host_ctx) {
+    const Seader* seader = host_ctx;
+    return seader && seader_sam_key_is_ice1803(
+                         seader->sam_key_probe_status,
+                         seader->sam_ice_value_storage,
+                         seader->sam_ice_value_len);
+}
+
 static const PluginHfHostApi seader_hf_plugin_host_api = {
     .notify_worker_exit = seader_hf_plugin_notify_worker_exit,
     .begin_card_session = seader_hf_plugin_begin_card_session,
@@ -877,6 +885,7 @@ static const PluginHfHostApi seader_hf_plugin_host_api = {
     .set_14a_sio = seader_hf_plugin_set_14a_sio,
     .get_nfc = seader_hf_plugin_get_nfc,
     .get_nfc_device = seader_hf_plugin_get_nfc_device,
+    .can_probe_config_card = seader_hf_plugin_can_probe_config_card,
     .picopass_detect = seader_hf_plugin_picopass_detect,
     .picopass_start = seader_hf_plugin_picopass_start,
     .picopass_stop = seader_hf_plugin_picopass_stop,
@@ -1020,6 +1029,8 @@ Seader* seader_alloc() {
     memset(seader->sam_version, 0, sizeof(seader->sam_version));
     seader->sam_key_probe_status = SeaderSamKeyProbeStatusUnknown;
     seader->uhf_probe_status = SeaderUhfProbeStatusUnknown;
+    memset(seader->sam_ice_value_storage, 0, sizeof(seader->sam_ice_value_storage));
+    seader->sam_ice_value_len = 0U;
     seader_sam_key_label_format(
         false,
         seader->sam_key_probe_status,

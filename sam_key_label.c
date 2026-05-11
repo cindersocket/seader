@@ -18,6 +18,18 @@ static bool seader_sam_key_label_is_missing(const uint8_t* value, size_t value_l
     return true;
 }
 
+bool seader_sam_key_is_ice1803(
+    SeaderSamKeyProbeStatus probe_status,
+    const uint8_t* elite_ice_value,
+    size_t elite_ice_value_len) {
+    static const uint8_t ice1803[] = {'I', 'C', 'E', '1', '8', '0', '3'};
+
+    return probe_status == SeaderSamKeyProbeStatusVerifiedValue &&
+           elite_ice_value_len == sizeof(ice1803) &&
+           elite_ice_value != NULL &&
+           memcmp(elite_ice_value, ice1803, sizeof(ice1803)) == 0;
+}
+
 void seader_sam_key_label_format(
     bool sam_present,
     SeaderSamKeyProbeStatus probe_status,

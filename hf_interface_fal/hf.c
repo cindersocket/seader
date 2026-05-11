@@ -19,6 +19,7 @@
 #define HF_PLUGIN_POLLER_MAX_FWT         (200000U)
 #define HF_PLUGIN_POLLER_MAX_BUFFER_SIZE (258U)
 #define HF_PLUGIN_MAX_ATS_SIZE           33U
+#define HF_PLUGIN_CONFIG_PROBE_TIMEOUT_MS 500U
 
 // ATS bit definitions
 #define ISO14443_4A_ATS_T0_TA1 (1U << 4)
@@ -37,11 +38,34 @@ typedef struct {
 } PluginHfContext;
 
 static const uint8_t plugin_hf_update_block2[] = {RFAL_PICOPASS_CMD_UPDATE, 0x02};
+static const uint8_t plugin_hf_select_config_applet[] = {
+    0x00,
+    0xA4,
+    0x04,
+    0x00,
+    0x0A,
+    0xA0,
+    0x00,
+    0x00,
+    0x03,
+    0x82,
+    0x00,
+    0x13,
+    0x00,
+    0x01,
+    0x01,
+    0xFF,
+};
 static const uint8_t plugin_hf_select_seos_app[] =
     {0x00, 0xa4, 0x04, 0x00, 0x0a, 0xa0, 0x00, 0x00, 0x04, 0x40, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00};
 static const uint8_t plugin_hf_select_desfire_app_no_le[] =
     {0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x00};
 static const uint8_t plugin_hf_file_not_found[] = {0x6a, 0x82};
+
+typedef struct {
+    FuriEventFlag* event;
+    bool aid_present;
+} PluginHfConfigProbeContext;
 
 static NfcCommand plugin_hf_run_conversation(PluginHfContext* ctx) {
     if(!ctx || !ctx->api) {
@@ -93,6 +117,7 @@ static bool plugin_hf_validate_host_api(const PluginHfHostApi* api) {
     HF_REQUIRE_API(set_14a_sio);
     HF_REQUIRE_API(get_nfc);
     HF_REQUIRE_API(get_nfc_device);
+    HF_REQUIRE_API(can_probe_config_card);
     HF_REQUIRE_API(picopass_detect);
     HF_REQUIRE_API(picopass_start);
     HF_REQUIRE_API(picopass_stop);
@@ -117,6 +142,74 @@ static PluginHfContext* plugin_hf_get_ctx(void* plugin_ctx) {
         return NULL;
     }
     return ctx;
+}
+
+static NfcCommand plugin_hf_config_probe_callback(NfcGenericEvent event, void* context) {
+    PluginHfConfigProbeContext* probe = context;
+    const Iso14443_4aPollerEvent* iso_event = event.event_data;
+    BitBuffer* tx_buffer = NULL;
+    BitBuffer* rx_buffer = NULL;
+
+    if(!probe || !probe->event) {
+        return NfcCommandStop;
+    }
+
+    if(event.protocol == NfcProtocolIso14443_4a && iso_event &&
+       iso_event->type == Iso14443_4aPollerEventTypeReady) {
+        tx_buffer = bit_buffer_alloc(sizeof(plugin_hf_select_config_applet));
+        rx_buffer = bit_buffer_alloc(HF_PLUGIN_POLLER_MAX_BUFFER_SIZE);
+        if(tx_buffer && rx_buffer) {
+            bit_buffer_append_bytes(
+                tx_buffer, plugin_hf_select_config_applet, sizeof(plugin_hf_select_config_applet));
+            const Iso14443_4aError error = iso14443_4a_poller_send_block(
+                (Iso14443_4aPoller*)event.instance, tx_buffer, rx_buffer);
+            if(error == Iso14443_4aErrorNone) {
+                const size_t rx_len = bit_buffer_get_size_bytes(rx_buffer);
+                const uint8_t* rx_data = bit_buffer_get_data(rx_buffer);
+                probe->aid_present =
+                    rx_len >= 2U && rx_data != NULL && rx_data[rx_len - 2U] == 0x90U &&
+                    rx_data[rx_len - 1U] == 0x00U;
+            }
+        }
+    }
+
+    if(tx_buffer) bit_buffer_free(tx_buffer);
+    if(rx_buffer) bit_buffer_free(rx_buffer);
+    furi_event_flag_set(probe->event, 1U);
+    return NfcCommandStop;
+}
+
+static bool plugin_hf_probe_config_card(PluginHfContext* ctx) {
+    FuriEventFlag* event = NULL;
+    NfcPoller* poller = NULL;
+    PluginHfConfigProbeContext probe = {0};
+    bool aid_present = false;
+
+    ctx = plugin_hf_get_ctx(ctx);
+    if(!ctx || !ctx->api->can_probe_config_card ||
+       !ctx->api->can_probe_config_card(ctx->host_ctx)) {
+        return false;
+    }
+
+    poller = nfc_poller_alloc(ctx->nfc, NfcProtocolIso14443_4a);
+    event = furi_event_flag_alloc();
+    if(!poller || !event) {
+        goto cleanup;
+    }
+
+    probe.event = event;
+    nfc_poller_start(poller, plugin_hf_config_probe_callback, &probe);
+    const uint32_t flags =
+        furi_event_flag_wait(event, 1U, FuriFlagWaitAny, HF_PLUGIN_CONFIG_PROBE_TIMEOUT_MS);
+    nfc_poller_stop(poller);
+    if(flags != FuriFlagErrorTimeout) {
+        aid_present = probe.aid_present;
+    }
+
+cleanup:
+    if(event) furi_event_flag_free(event);
+    if(poller) nfc_poller_free(poller);
+    return aid_present;
 }
 
 static void plugin_hf_cleanup_pollers(PluginHfContext* ctx) {
@@ -758,6 +851,7 @@ static bool plugin_hf_start_read_for_type(void* plugin_ctx, SeaderCredentialType
         return false;
     }
     NfcPoller* poller_detect = NULL;
+    bool config_card_present = false;
 
     plugin_hf_cleanup_pollers(ctx);
     ctx->active_type = type;
@@ -774,12 +868,15 @@ static bool plugin_hf_start_read_for_type(void* plugin_ctx, SeaderCredentialType
             return false;
         }
         nfc_poller_free(poller_detect);
+        config_card_present = plugin_hf_probe_config_card(ctx);
         ctx->poller = nfc_poller_alloc(ctx->nfc, NfcProtocolIso14443_4a);
         if(!ctx->poller) {
             FURI_LOG_E(TAG, "Failed to allocate 14A poller");
             return false;
         }
-        ctx->api->set_credential_type(ctx->host_ctx, SeaderCredentialType14A);
+        ctx->active_type =
+            config_card_present ? SeaderCredentialTypeConfig : SeaderCredentialType14A;
+        ctx->api->set_credential_type(ctx->host_ctx, ctx->active_type);
         ctx->api->set_stage(ctx->host_ctx, PluginHfStageCardDetect);
         nfc_poller_start(ctx->poller, plugin_hf_poller_callback_iso14443_4a, ctx);
         return true;
