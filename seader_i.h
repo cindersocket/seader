@@ -66,6 +66,7 @@
 #include "sam_key_label.h"
 #include "uhf_snmp_probe.h"
 #include "uhf_status_label.h"
+#include "uhf_module_probe.h"
 
 #define WORKER_ALL_RX_EVENTS                                                      \
     (WorkerEvtStop | WorkerEvtRxDone | WorkerEvtCfgChange | WorkerEvtLineCfgSet | \
@@ -93,6 +94,7 @@ enum SeaderCustomEvent {
     SeaderCustomEventBoardPowerLost,
     SeaderCustomEventStartDetect,
     SeaderCustomEventBeginRead,
+    SeaderCustomEventUhfStatusUpdated,
 };
 
 typedef enum {
@@ -172,6 +174,15 @@ struct Seader {
     size_t ATR_len;
     SeaderSamKeyProbeStatus sam_key_probe_status;
     SeaderUhfProbeStatus uhf_probe_status;
+    SeaderUhfModuleStatus uhf_module_status;
+    SeaderUhfModuleInfo uhf_module_info;
+    char uhf_module_label[SEADER_UHF_MODULE_LABEL_MAX_LEN];
+    FuriThread* uhf_probe_thread;
+    FuriHalSerialHandle* uhf_probe_serial;
+    bool uhf_probe_init_by_app;
+    volatile bool uhf_probe_rx_active;
+    uint8_t uhf_probe_stream[SEADER_UHF_MODULE_RX_STREAM_MAX];
+    size_t uhf_probe_stream_len;
     uint8_t sam_ice_value_storage[SEADER_UHF_SNMP_MAX_VALUE_LEN];
     size_t sam_ice_value_len;
     char sam_key_label[SEADER_SAM_KEY_LABEL_MAX_LEN];
@@ -216,6 +227,7 @@ struct Seader {
     SeaderHfReadFailureReason hf_read_failure_reason;
     uint32_t hf_read_last_progress_tick;
     bool loading_popup_enabled;
+    bool ui_events_enabled;
     bool start_scene_active;
     bool sam_present_menu_guard_active;
 

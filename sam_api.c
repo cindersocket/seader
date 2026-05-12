@@ -187,8 +187,30 @@ static void seader_snmp_probe_finish(Seader* seader) {
 
 /* UHF maintenance is only legal when the SAM is present and HF runtime is fully unloaded.
    The helper enforces that ownership boundary before any SNMP request is sent. */
-static void seader_start_snmp_probe(Seader* seader) {
+void seader_start_uhf_capability_probe(Seader* seader) {
     if(!seader || !seader->sam_present) {
+        return;
+    }
+
+    if(seader->board_attachment != SeaderBoardAttachmentUhfCarrier) {
+        seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
+        seader_update_uhf_status_label(seader);
+        return;
+    }
+
+    if(seader->uhf_module_status == SeaderUhfModuleStatusDetecting) {
+        return;
+    }
+
+    if(seader->uhf_module_status != SeaderUhfModuleStatusPresent) {
+        seader->uhf_probe_status = SeaderUhfProbeStatusFailed;
+        seader_update_uhf_status_label(seader);
+        return;
+    }
+
+    if(seader->uhf_probe_status == SeaderUhfProbeStatusSuccess ||
+       (seader->mode_runtime == SeaderModeRuntimeUHF &&
+        seader->sam_state == SeaderSamStateCapabilityPending)) {
         return;
     }
 
@@ -1122,7 +1144,7 @@ bool seader_parse_sam_response(Seader* seader, SamResponse_t* samResponse) {
     case SeaderSamStateSerialPending:
         FURI_LOG_I(TAG, "samResponse serial");
         seader_parse_serial_number(seader, samResponse->buf, samResponse->size);
-        seader_start_snmp_probe(seader);
+        seader_start_uhf_capability_probe(seader);
         break;
     case SeaderSamStateCapabilityPending:
         SEADER_VERBOSE_I(TAG, "samResponse processSNMPMessage");

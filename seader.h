@@ -37,6 +37,7 @@ void seader_worker_release(Seader* seader);
 bool seader_temp_strings_ensure(Seader* seader, size_t count);
 void seader_temp_strings_release(Seader* seader, size_t count);
 bool seader_board_retry_power_cycle(Seader* seader);
+void seader_uhf_probe_start(Seader* seader);
 void seader_start_popup_set_stage(Seader* seader, SeaderStartupStage stage);
 bool seader_wiegand_plugin_acquire(Seader* seader);
 void seader_wiegand_plugin_release(Seader* seader);

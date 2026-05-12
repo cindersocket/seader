@@ -27,6 +27,7 @@ test-host:
 		lib/host_tests/test_t1_protocol.c \
 		lib/host_tests/test_snmp.c \
 		lib/host_tests/test_uhf_status_label.c \
+		lib/host_tests/test_uhf_module_probe.c \
 		lib/host_tests/test_credential_sio_label.c \
 		lib/host_tests/test_hf_read_plan.c \
 		lib/host_tests/test_wiegand_plugin.c \
@@ -47,6 +48,7 @@ test-host:
 		snmp_codec.c \
 		snmp_response_view.c \
 		uhf_status_label.c \
+		uhf_module_probe.c \
 		uhf_tag_config_view.c \
 		uhf_snmp_probe.c \
 		hf_read_lifecycle.c \

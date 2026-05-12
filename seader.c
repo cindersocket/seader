@@ -10,12 +10,18 @@
 #define SEADER_WIEGAND_PLUGIN_PATH                APP_ASSETS_PATH("plugins/plugin_wiegand.fal")
 #define SEADER_HF_PLUGIN_PATH                     APP_ASSETS_PATH("plugins/plugin_hf.fal")
 #define SEADER_BOARD_PROBE_SETTLE_MS              2U
-#define SEADER_BOARD_POWER_SETTLE_MS              250U
-#define SEADER_BOARD_ENABLE_SETTLE_MS             150U
 #define SEADER_BOARD_RETRY_COOLDOWN_MS            100U
 #define SEADER_BOARD_POWER_MONITOR_INTERVAL_TICKS 5U
 #define SEADER_BOARD_POWER_HANDOFF_GRACE_MS       2000U
 #define SEADER_HF_CONVERSATION_TIMEOUT_MS         3000U
+#define SEADER_UHF_PROBE_WORKER_STACK_SIZE        (2U * 1024U)
+#define SEADER_UHF_PROBE_TIMEOUT_MS               500U
+#define SEADER_UHF_PROBE_STEP_MS                  5U
+#define SEADER_UHF_PROBE_ATTEMPTS                 1U
+#define SEADER_UHF_PROBE_RETRY_MS                 150U
+#define SEADER_UHF_PROBE_POWER_SETTLE_MS          1000U
+#define SEADER_UHF_PROBE_ENABLE_SETTLE_MS         500U
+#define SEADER_UHF_UART_BAUDRATE                  115200U
 
 typedef struct {
     volatile bool done;
@@ -30,6 +36,8 @@ static void seader_hf_read_note_progress(Seader* seader);
 static void seader_hf_read_fail(Seader* seader, SeaderHfReadFailureReason reason);
 static bool seader_board_auto_recover_begin(Seader* seader);
 static void seader_hf_mode_reset(Seader* seader);
+static void seader_uhf_probe_join(Seader* seader);
+static void seader_uhf_set_module_status(Seader* seader, SeaderUhfModuleStatus status);
 
 bool seader_temp_strings_ensure(Seader* seader, size_t count) {
     if(!seader || count > 4U) {
@@ -156,6 +164,8 @@ static void seader_board_prepare_missing_state(Seader* seader, SeaderBoardStatus
         0U,
         seader->sam_key_label,
         sizeof(seader->sam_key_label));
+    seader->uhf_probe_status = SeaderUhfProbeStatusUnknown;
+    seader_uhf_set_module_status(seader, SeaderUhfModuleStatusNotApplicable);
 }
 
 static bool seader_board_auto_recover_begin(Seader* seader) {
@@ -368,6 +378,39 @@ static void seader_board_set_enable_pin(bool enabled) {
     furi_hal_gpio_write(&gpio_ext_pc3, enabled);
 }
 
+static void seader_uhf_update_module_label(Seader* seader) {
+    if(!seader) {
+        return;
+    }
+
+    seader_uhf_module_status_label_format(
+        seader->board_attachment,
+        seader->uhf_module_status,
+        &seader->uhf_module_info,
+        seader->uhf_module_label,
+        sizeof(seader->uhf_module_label));
+}
+
+static void seader_uhf_publish_status(Seader* seader) {
+    seader_uhf_update_module_label(seader);
+    if(seader && seader->ui_events_enabled && seader->view_dispatcher) {
+        view_dispatcher_send_custom_event(
+            seader->view_dispatcher, SeaderCustomEventUhfStatusUpdated);
+    }
+}
+
+static void seader_uhf_set_module_status(Seader* seader, SeaderUhfModuleStatus status) {
+    if(!seader) {
+        return;
+    }
+
+    seader->uhf_module_status = status;
+    if(status != SeaderUhfModuleStatusPresent) {
+        seader_uhf_module_info_reset(&seader->uhf_module_info);
+    }
+    seader_uhf_publish_status(seader);
+}
+
 void seader_start_popup_set_stage(Seader* seader, SeaderStartupStage stage) {
     if(!seader || !seader->popup) {
         return;
@@ -459,6 +502,10 @@ static bool seader_board_power_on(Seader* seader) {
         return true;
     }
 
+    if(plan.should_reset_before_enable && plan.off_settle_ms > 0U) {
+        furi_delay_ms(plan.off_settle_ms);
+    }
+
     if(plan.should_enable_otg) {
         if(!seader->power) {
             seader->board_status = SeaderBoardStatusFaultPreEnable;
@@ -475,7 +522,9 @@ static bool seader_board_power_on(Seader* seader) {
         return true;
     }
 
-    furi_delay_ms(SEADER_BOARD_POWER_SETTLE_MS);
+    if(plan.power_settle_ms > 0U) {
+        furi_delay_ms(plan.power_settle_ms);
+    }
     const bool otg_enabled = furi_hal_power_is_otg_enabled();
     const uint16_t vbus_mv = seader_board_vbus_mv_from_volts(furi_hal_power_get_usb_voltage());
     seader->board_power_owned = plan.owns_otg && otg_enabled;
@@ -501,7 +550,9 @@ static bool seader_board_power_on(Seader* seader) {
     }
 
     seader_board_set_enable_pin(true);
-    furi_delay_ms(SEADER_BOARD_ENABLE_SETTLE_MS);
+    if(plan.enable_settle_ms > 0U) {
+        furi_delay_ms(plan.enable_settle_ms);
+    }
     if(furi_hal_power_check_otg_fault()) {
         FURI_LOG_W(TAG, "Board power fault after enable");
         seader_board_power_fail(seader, SeaderBoardStatusFaultPostEnable);
@@ -518,6 +569,7 @@ static void seader_board_power_off(Seader* seader) {
         return;
     }
 
+    seader_uhf_probe_join(seader);
     seader_board_set_enable_pin(false);
     if(seader->power && seader_board_should_disable_owned_otg(
                             seader->board_power_owned, furi_hal_power_is_otg_enabled())) {
@@ -526,6 +578,234 @@ static void seader_board_power_off(Seader* seader) {
     seader->board_power_enabled = false;
     seader->board_power_owned = false;
     seader->board_power_monitor_active = false;
+}
+
+static void seader_uhf_probe_rx_cb(
+    FuriHalSerialHandle* handle,
+    FuriHalSerialRxEvent event,
+    void* context) {
+    Seader* seader = context;
+    if(!seader || !seader->uhf_probe_rx_active || !(event & FuriHalSerialRxEventData)) {
+        return;
+    }
+
+    while(furi_hal_serial_async_rx_available(handle)) {
+        if(seader->uhf_probe_stream_len < sizeof(seader->uhf_probe_stream)) {
+            seader->uhf_probe_stream[seader->uhf_probe_stream_len++] =
+                furi_hal_serial_async_rx(handle);
+        } else {
+            memmove(
+                seader->uhf_probe_stream,
+                seader->uhf_probe_stream + 1U,
+                sizeof(seader->uhf_probe_stream) - 1U);
+            seader->uhf_probe_stream[sizeof(seader->uhf_probe_stream) - 1U] =
+                furi_hal_serial_async_rx(handle);
+        }
+    }
+}
+
+static bool seader_uhf_probe_open(Seader* seader) {
+    if(!seader || seader->uhf_probe_serial ||
+       furi_hal_serial_control_is_busy(FuriHalSerialIdUsart)) {
+        return false;
+    }
+
+    seader->uhf_probe_serial = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+    if(!seader->uhf_probe_serial) {
+        return false;
+    }
+
+    seader->uhf_probe_init_by_app = !furi_hal_bus_is_enabled(FuriHalBusUSART1);
+    if(seader->uhf_probe_init_by_app) {
+        furi_hal_serial_init(seader->uhf_probe_serial, SEADER_UHF_UART_BAUDRATE);
+    } else {
+        furi_hal_serial_set_br(seader->uhf_probe_serial, SEADER_UHF_UART_BAUDRATE);
+    }
+    seader->uhf_probe_rx_active = true;
+    seader->uhf_probe_stream_len = 0U;
+    memset(seader->uhf_probe_stream, 0, sizeof(seader->uhf_probe_stream));
+    furi_hal_serial_async_rx_start(
+        seader->uhf_probe_serial, seader_uhf_probe_rx_cb, seader, false);
+    return true;
+}
+
+static void seader_uhf_probe_close(Seader* seader) {
+    if(!seader || !seader->uhf_probe_serial) {
+        return;
+    }
+
+    seader->uhf_probe_rx_active = false;
+    furi_hal_serial_async_rx_stop(seader->uhf_probe_serial);
+    if(seader->uhf_probe_init_by_app) {
+        furi_hal_serial_deinit(seader->uhf_probe_serial);
+    }
+    furi_hal_serial_control_release(seader->uhf_probe_serial);
+    seader->uhf_probe_serial = NULL;
+    seader->uhf_probe_init_by_app = false;
+    seader->uhf_probe_stream_len = 0U;
+}
+
+static bool seader_uhf_probe_send_expect(
+    Seader* seader,
+    const uint8_t* command,
+    size_t command_len,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len) {
+    if(payload_len) {
+        *payload_len = 0U;
+    }
+    if(!seader || !seader->uhf_probe_serial || !command || command_len == 0U || !payload ||
+       !payload_len) {
+        return false;
+    }
+
+    seader->uhf_probe_stream_len = 0U;
+    memset(seader->uhf_probe_stream, 0, sizeof(seader->uhf_probe_stream));
+    furi_hal_serial_tx(seader->uhf_probe_serial, command, command_len);
+    furi_hal_serial_tx_wait_complete(seader->uhf_probe_serial);
+
+    uint32_t waited = 0U;
+    while(waited <= SEADER_UHF_PROBE_TIMEOUT_MS) {
+        if(seader_uhf_module_try_parse_frame(
+               seader->uhf_probe_stream,
+               seader->uhf_probe_stream_len,
+               0x01U,
+               expected_cmd,
+               payload,
+               payload_cap,
+               payload_len)) {
+            return true;
+        }
+        furi_delay_ms(SEADER_UHF_PROBE_STEP_MS);
+        waited += SEADER_UHF_PROBE_STEP_MS;
+    }
+
+    return false;
+}
+
+static int32_t seader_uhf_probe_worker(void* context) {
+    Seader* seader = context;
+    uint8_t hw_payload[SEADER_UHF_MODULE_RX_MAX] = {0};
+    uint8_t sw_payload[SEADER_UHF_MODULE_RX_MAX] = {0};
+    size_t hw_payload_len = 0U;
+    size_t sw_payload_len = 0U;
+    bool detected = false;
+    bool fault = false;
+
+    if(!seader || seader->board_attachment != SeaderBoardAttachmentUhfCarrier ||
+       !seader->board_power_enabled) {
+        if(seader) {
+            seader_uhf_set_module_status(seader, SeaderUhfModuleStatusNotApplicable);
+        }
+        return 0;
+    }
+
+    furi_delay_ms(SEADER_UHF_PROBE_POWER_SETTLE_MS + SEADER_UHF_PROBE_ENABLE_SETTLE_MS);
+
+    for(uint8_t attempt = 0U; attempt < SEADER_UHF_PROBE_ATTEMPTS; attempt++) {
+        if(!seader_uhf_probe_open(seader)) {
+            fault = true;
+            break;
+        }
+
+        const bool hw_ok = seader_uhf_probe_send_expect(
+            seader,
+            seader_uhf_module_cmd_hw_version,
+            sizeof(seader_uhf_module_cmd_hw_version),
+            0x03U,
+            hw_payload,
+            sizeof(hw_payload),
+            &hw_payload_len);
+        bool sw_ok = false;
+        if(hw_ok) {
+            furi_delay_ms(10U);
+            sw_ok = seader_uhf_probe_send_expect(
+                seader,
+                seader_uhf_module_cmd_sw_version,
+                sizeof(seader_uhf_module_cmd_sw_version),
+                0x03U,
+                sw_payload,
+                sizeof(sw_payload),
+                &sw_payload_len);
+        }
+        seader_uhf_probe_close(seader);
+
+        detected = hw_ok || sw_ok;
+        if(detected) {
+            break;
+        }
+        furi_delay_ms(SEADER_UHF_PROBE_RETRY_MS);
+    }
+
+    if(detected) {
+        seader_uhf_module_info_set_versions(
+            &seader->uhf_module_info,
+            hw_payload,
+            hw_payload_len,
+            sw_payload,
+            sw_payload_len);
+        seader->uhf_module_status = SeaderUhfModuleStatusPresent;
+        seader_uhf_publish_status(seader);
+    } else {
+        seader_uhf_set_module_status(
+            seader, fault ? SeaderUhfModuleStatusFault : SeaderUhfModuleStatusMissing);
+    }
+
+    return 0;
+}
+
+static void seader_uhf_probe_cleanup_stopped(Seader* seader) {
+    if(!seader || !seader->uhf_probe_thread) {
+        return;
+    }
+    if(furi_thread_get_state(seader->uhf_probe_thread) == FuriThreadStateStopped) {
+        furi_thread_join(seader->uhf_probe_thread);
+        furi_thread_free(seader->uhf_probe_thread);
+        seader->uhf_probe_thread = NULL;
+    }
+}
+
+static void seader_uhf_probe_join(Seader* seader) {
+    if(!seader || !seader->uhf_probe_thread) {
+        return;
+    }
+
+    furi_thread_join(seader->uhf_probe_thread);
+    furi_thread_free(seader->uhf_probe_thread);
+    seader->uhf_probe_thread = NULL;
+    seader_uhf_probe_close(seader);
+}
+
+void seader_uhf_probe_start(Seader* seader) {
+    if(!seader) {
+        return;
+    }
+
+    seader_uhf_probe_cleanup_stopped(seader);
+    if(seader->uhf_probe_thread) {
+        return;
+    }
+
+    if(seader->board_attachment != SeaderBoardAttachmentUhfCarrier ||
+       !seader->board_power_enabled) {
+        seader_uhf_set_module_status(seader, SeaderUhfModuleStatusNotApplicable);
+        return;
+    }
+
+    seader_uhf_module_info_reset(&seader->uhf_module_info);
+    seader->uhf_module_status = SeaderUhfModuleStatusDetecting;
+    seader_uhf_publish_status(seader);
+
+    seader->uhf_probe_thread = furi_thread_alloc_ex(
+        "SeaderUhfProbe", SEADER_UHF_PROBE_WORKER_STACK_SIZE, seader_uhf_probe_worker, seader);
+    if(!seader->uhf_probe_thread) {
+        seader_uhf_set_module_status(seader, SeaderUhfModuleStatusFault);
+        return;
+    }
+    furi_thread_set_priority(seader->uhf_probe_thread, FuriThreadPriorityNormal);
+    furi_thread_start(seader->uhf_probe_thread);
 }
 
 bool seader_board_retry_power_cycle(Seader* seader) {
@@ -976,11 +1256,20 @@ static void seader_hf_release_worker_reset(void* context) {
 bool seader_custom_event_callback(void* context, uint32_t event) {
     furi_assert(context);
     Seader* seader = context;
+    furi_check(seader->scene_manager);
+
     if(event == SeaderCustomEventBoardAutoRecover) {
         return seader_board_auto_recover_begin(seader);
     }
     if(event == SeaderCustomEventBoardPowerLost) {
         return seader_board_handle_runtime_power_lost(seader);
+    }
+    if(event == SeaderCustomEventUhfStatusUpdated) {
+        seader_uhf_probe_cleanup_stopped(seader);
+        if(seader->uhf_module_status == SeaderUhfModuleStatusPresent) {
+            seader_start_uhf_capability_probe(seader);
+        }
+        return scene_manager_handle_custom_event(seader->scene_manager, SeaderCustomEventSamStatusUpdated);
     }
     return scene_manager_handle_custom_event(seader->scene_manager, event);
 }
@@ -999,7 +1288,8 @@ void seader_tick_event_callback(void* context) {
 }
 
 Seader* seader_alloc() {
-    Seader* seader = malloc(sizeof(Seader));
+    Seader* seader = calloc(1U, sizeof(Seader));
+    furi_check(seader);
     seader_trace_reset();
 
     seader->board_attachment = SeaderBoardAttachmentUnknownOrNone;
@@ -1029,6 +1319,14 @@ Seader* seader_alloc() {
     memset(seader->sam_version, 0, sizeof(seader->sam_version));
     seader->sam_key_probe_status = SeaderSamKeyProbeStatusUnknown;
     seader->uhf_probe_status = SeaderUhfProbeStatusUnknown;
+    seader->uhf_module_status = SeaderUhfModuleStatusNotApplicable;
+    seader_uhf_module_info_reset(&seader->uhf_module_info);
+    seader->uhf_module_label[0] = '\0';
+    seader->uhf_probe_thread = NULL;
+    seader->uhf_probe_serial = NULL;
+    seader->uhf_probe_init_by_app = false;
+    seader->uhf_probe_rx_active = false;
+    seader->uhf_probe_stream_len = 0U;
     memset(seader->sam_ice_value_storage, 0, sizeof(seader->sam_ice_value_storage));
     seader->sam_ice_value_len = 0U;
     seader_sam_key_label_format(
@@ -1046,6 +1344,7 @@ Seader* seader_alloc() {
         false,
         seader->uhf_status_label,
         sizeof(seader->uhf_status_label));
+    seader_uhf_update_module_label(seader);
     seader_uhf_snmp_probe_init(&seader->snmp_probe);
     seader->nfc = nfc_alloc();
     seader->nfc_device = seader->nfc ? nfc_device_alloc() : NULL;
@@ -1120,6 +1419,7 @@ Seader* seader_alloc() {
     seader->hf_teardown_action = SeaderHfTeardownActionNone;
     seader_hf_read_reset(seader);
     seader->loading_popup_enabled = true;
+    seader->ui_events_enabled = true;
     seader->start_scene_active = false;
     seader->sam_present_menu_guard_active = false;
 
@@ -1141,7 +1441,9 @@ Seader* seader_alloc() {
 void seader_free(Seader* seader) {
     furi_assert(seader);
 
+    seader->ui_events_enabled = false;
     seader->loading_popup_enabled = false;
+    seader_uhf_probe_join(seader);
     seader_hf_teardown_blocking(seader);
     seader_hf_mode_deactivate(seader);
     seader_worker_release(seader);
@@ -1179,6 +1481,11 @@ void seader_free(Seader* seader) {
 
     seader_credential_free(seader->credential);
     seader->credential = NULL;
+
+    if(seader->scene_manager) {
+        scene_manager_free(seader->scene_manager);
+        seader->scene_manager = NULL;
+    }
 
     // Submenu
     view_dispatcher_remove_view(seader->view_dispatcher, SeaderViewMenu);
@@ -1221,9 +1528,6 @@ void seader_free(Seader* seader) {
 
     // View Dispatcher
     view_dispatcher_free(seader->view_dispatcher);
-
-    // Scene Manager
-    scene_manager_free(seader->scene_manager);
 
     // GUI
     furi_record_close(RECORD_GUI);

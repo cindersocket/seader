@@ -46,3 +46,4 @@ bool seader_worker_send_process_snmp_message(
     Seader* seader,
     const uint8_t* message,
     size_t message_len);
+void seader_start_uhf_capability_probe(Seader* seader);
