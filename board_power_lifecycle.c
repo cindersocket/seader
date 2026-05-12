@@ -1,6 +1,8 @@
 #include "board_power_lifecycle.h"
 
 #define SEADER_BOARD_POWER_AVAILABLE_MV 4500U
+#define SEADER_BOARD_UHF_POWER_SETTLE_MS 100U
+#define SEADER_BOARD_UHF_ENABLE_SETTLE_MS 100U
 
 SeaderBoardAttachment seader_board_attachment_classify(bool pa4_high, bool pc1_high, bool pc0_high) {
     if(pa4_high) {
@@ -38,6 +40,8 @@ SeaderBoardPowerAcquirePlan
         plan.should_assert_enable = true;
         plan.should_validate_power = true;
         plan.should_monitor_runtime = true;
+        plan.power_settle_ms = SEADER_BOARD_UHF_POWER_SETTLE_MS;
+        plan.enable_settle_ms = SEADER_BOARD_UHF_ENABLE_SETTLE_MS;
     }
 
     return plan;

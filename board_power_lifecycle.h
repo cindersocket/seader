@@ -39,6 +39,10 @@ typedef struct {
     bool should_assert_enable;
     bool should_validate_power;
     bool should_monitor_runtime;
+    bool should_reset_before_enable;
+    uint16_t off_settle_ms;
+    uint16_t power_settle_ms;
+    uint16_t enable_settle_ms;
 } SeaderBoardPowerAcquirePlan;
 
 SeaderBoardAttachment

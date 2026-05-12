@@ -15,6 +15,10 @@ static MunitResult test_acquire_plan_when_otg_is_off(
     munit_assert_true(plan.should_assert_enable);
     munit_assert_true(plan.should_validate_power);
     munit_assert_true(plan.should_monitor_runtime);
+    munit_assert_false(plan.should_reset_before_enable);
+    munit_assert_uint16(plan.off_settle_ms, ==, 0U);
+    munit_assert_uint16(plan.power_settle_ms, ==, 100U);
+    munit_assert_uint16(plan.enable_settle_ms, ==, 100U);
     return MUNIT_OK;
 }
 
@@ -31,6 +35,10 @@ static MunitResult test_acquire_plan_when_otg_is_already_on(
     munit_assert_true(plan.should_assert_enable);
     munit_assert_true(plan.should_validate_power);
     munit_assert_true(plan.should_monitor_runtime);
+    munit_assert_false(plan.should_reset_before_enable);
+    munit_assert_uint16(plan.off_settle_ms, ==, 0U);
+    munit_assert_uint16(plan.power_settle_ms, ==, 100U);
+    munit_assert_uint16(plan.enable_settle_ms, ==, 100U);
     return MUNIT_OK;
 }
 
@@ -47,6 +55,10 @@ static MunitResult test_acquire_plan_skips_uhf_power_for_non_uhf_boards(
     munit_assert_true(sam_only_plan.should_assert_enable);
     munit_assert_false(sam_only_plan.should_validate_power);
     munit_assert_false(sam_only_plan.should_monitor_runtime);
+    munit_assert_false(sam_only_plan.should_reset_before_enable);
+    munit_assert_uint16(sam_only_plan.off_settle_ms, ==, 0U);
+    munit_assert_uint16(sam_only_plan.power_settle_ms, ==, 0U);
+    munit_assert_uint16(sam_only_plan.enable_settle_ms, ==, 0U);
 
     SeaderBoardPowerAcquirePlan unknown_plan =
         seader_board_power_plan_acquire(SeaderBoardAttachmentUnknownOrNone, false);
