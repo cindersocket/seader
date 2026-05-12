@@ -69,6 +69,34 @@ class HardwareExerciserCaptureCliTests(unittest.TestCase):
             ),
         )
 
+    def test_status_and_board_snapshot_commands_have_empty_bodies(self) -> None:
+        status_args = self.parser.parse_args(["/dev/ttyACM0", "status"])
+        snapshot_args = self.parser.parse_args(["/dev/ttyACM0", "board-snapshot"])
+
+        self.assertEqual(capture.build_body(status_args), (capture.OPCODE_GET_STATUS, b""))
+        self.assertEqual(
+            capture.build_body(snapshot_args), (capture.OPCODE_BOARD_SNAPSHOT, b"")
+        )
+
+    def test_uhf_commands_are_encoded(self) -> None:
+        power_args = self.parser.parse_args(["/dev/ttyACM0", "uhf-power", "hibernate"])
+        probe_args = self.parser.parse_args(["/dev/ttyACM0", "uhf-probe"])
+        bridge_args = self.parser.parse_args(["/dev/ttyACM0", "uhf-bridge", "force"])
+        no5v_args = self.parser.parse_args(["/dev/ttyACM0", "uhf-no5v-test"])
+
+        self.assertEqual(
+            capture.build_body(power_args),
+            (capture.OPCODE_UHF_POWER, bytes([capture.UHF_POWER_ACTION["hibernate"]])),
+        )
+        self.assertEqual(capture.build_body(probe_args), (capture.OPCODE_UHF_PROBE, b""))
+        self.assertEqual(
+            capture.build_body(bridge_args),
+            (capture.OPCODE_UHF_BRIDGE, bytes([capture.UHF_BRIDGE_ACTION["force"]])),
+        )
+        self.assertEqual(
+            capture.build_body(no5v_args), (capture.OPCODE_UHF_NO5V_TEST, b"")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,8 @@ PC_TO_RDR_ESCAPE = 0x6B
 HX_VERSION = 1
 
 OPCODE_GET_CAPS = 0x02
+OPCODE_GET_STATUS = 0x03
+OPCODE_BOARD_SNAPSHOT = 0x04
 OPCODE_GPIO_LIST_PINS = 0x40
 OPCODE_GPIO_CONFIGURE = 0x41
 OPCODE_GPIO_WRITE = 0x42
@@ -24,6 +26,10 @@ OPCODE_GPIO_READ = 0x43
 OPCODE_GPIO_READ_ANALOG = 0x44
 OPCODE_GPIO_VECTOR = 0x45
 OPCODE_GPIO_RESET = 0x46
+OPCODE_UHF_POWER = 0x50
+OPCODE_UHF_PROBE = 0x51
+OPCODE_UHF_BRIDGE = 0x52
+OPCODE_UHF_NO5V_TEST = 0x53
 OPCODE_QUIT = 0x7E
 
 GPIO_MODE = {
@@ -42,6 +48,18 @@ GPIO_PULL = {
 GPIO_SAMPLE_KIND = {
     "d": 0,
     "a": 1,
+}
+
+UHF_POWER_ACTION = {
+    "off": 0,
+    "on": 1,
+    "hibernate": 2,
+}
+
+UHF_BRIDGE_ACTION = {
+    "disable": 0,
+    "enable": 1,
+    "force": 2,
 }
 
 
@@ -115,6 +133,10 @@ def build_body(args: argparse.Namespace) -> tuple[int, bytes]:
     command = args.command
     if command in (None, "raw"):
         return args.opcode, bytes.fromhex(args.body_hex) if args.body_hex else b""
+    if command == "status":
+        return OPCODE_GET_STATUS, b""
+    if command == "board-snapshot":
+        return OPCODE_BOARD_SNAPSHOT, b""
     if command == "list-pins":
         return OPCODE_GPIO_LIST_PINS, b""
     if command == "configure":
@@ -139,6 +161,14 @@ def build_body(args: argparse.Namespace) -> tuple[int, bytes]:
         return OPCODE_GPIO_RESET, b""
     if command == "quit":
         return OPCODE_QUIT, b""
+    if command == "uhf-power":
+        return OPCODE_UHF_POWER, bytes([UHF_POWER_ACTION[args.action]])
+    if command == "uhf-probe":
+        return OPCODE_UHF_PROBE, b""
+    if command == "uhf-bridge":
+        return OPCODE_UHF_BRIDGE, bytes([UHF_BRIDGE_ACTION[args.action]])
+    if command == "uhf-no5v-test":
+        return OPCODE_UHF_NO5V_TEST, b""
     if command == "vector":
         write_items = [parse_write_item(item) for item in args.write]
         sample_items = [parse_sample_item(item) for item in args.sample]
@@ -169,6 +199,8 @@ def create_parser() -> argparse.ArgumentParser:
     raw.add_argument("--opcode", type=lambda x: int(x, 0), default=OPCODE_GET_CAPS)
     raw.add_argument("--body-hex", default="", help="Raw HX request body bytes.")
 
+    subparsers.add_parser("status")
+    subparsers.add_parser("board-snapshot")
     subparsers.add_parser("list-pins")
 
     configure = subparsers.add_parser("configure")
@@ -194,6 +226,16 @@ def create_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("reset")
     subparsers.add_parser("quit")
+
+    uhf_power = subparsers.add_parser("uhf-power")
+    uhf_power.add_argument("action", choices=sorted(UHF_POWER_ACTION))
+
+    subparsers.add_parser("uhf-probe")
+
+    uhf_bridge = subparsers.add_parser("uhf-bridge")
+    uhf_bridge.add_argument("action", choices=sorted(UHF_BRIDGE_ACTION))
+
+    subparsers.add_parser("uhf-no5v-test")
 
     return parser
 

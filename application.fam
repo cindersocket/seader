@@ -83,6 +83,7 @@ App(
     requires=[
         "gui",
         "nfc",
+        "storage",
     ],
     stack_size=6 * 1024,
     order=21,

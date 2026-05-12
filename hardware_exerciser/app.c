@@ -10,11 +10,15 @@
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <input/input.h>
+#include <flipper_format/flipper_format.h>
 #include <lib/lfrfid/lfrfid_worker.h>
 #include <lib/nfc/nfc.h>
 #include <lib/nfc/nfc_device.h>
 #include <lfrfid/protocols/lfrfid_protocols.h>
 #include <nfc/nfc_poller.h>
+#include <storage/storage.h>
+#include <stdio.h>
+#include <string.h>
 #include <toolbox/protocols/protocol_dict.h>
 #include <lib/nfc/protocols/iso14443_3a/iso14443_3a.h>
 #include <lib/nfc/protocols/iso14443_3a/iso14443_3a_poller.h>
@@ -50,6 +54,23 @@
 #define HE_ESCAPE_FRAME_BUF_SIZE (HE_ESCAPE_BODY_MAX + 32U)
 #define HE_SAM_BRIDGE_WORKER_STACK_SIZE (6U * 1024U)
 #define HE_UHF_BRIDGE_WORKER_STACK_SIZE (2U * 1024U)
+#define HE_UHF_UART_BAUDRATE 115200U
+#define HE_UHF_RX_STREAM_MAX 384U
+#define HE_UHF_RX_MAX 96U
+#define HE_UHF_PROBE_TIMEOUT_MS 500U
+#define HE_UHF_PROBE_STEP_MS 5U
+#define HE_UHF_POWER_SETTLE_MS 1000U
+#define HE_UHF_ENABLE_SETTLE_MS 500U
+#define HE_UHF_ALT_SETTLE_MS 2000U
+#define HE_UHF_CLOSE_SETTLE_MS 20U
+#define HE_UHF_DETECT_ATTEMPTS 3U
+#define HE_UHF_DETECT_RETRY_MS 150U
+#define HE_UHF_POWER_AVAILABLE_MV 4500U
+#define HE_NO5V_REPORT_FILE APP_DATA_PATH("uhf_no5v_last.txt")
+#define HE_NO5V_RESPONSE_HEX_MAX 64U
+#define HE_UHF_RX_EVIDENCE_MAX 32U
+#define HE_UHF_RESET_DEFAULT_OFF_MS 1000U
+#define HE_UHF_RESET_PIN_LOW_MS 50U
 #if HE_DEBUG_TRACE
 #define HE_DIAG_CAPACITY 128U
 #endif
@@ -95,6 +116,96 @@ typedef enum {
 } HeBridgeStopStatus;
 
 typedef struct HardwareExerciserApp HardwareExerciserApp;
+
+typedef struct {
+    FuriHalSerialHandle* handle;
+    bool init_by_app;
+    bool rx_active;
+    uint8_t stream[HE_UHF_RX_STREAM_MAX];
+    size_t stream_len;
+} HeUhfProbeSession;
+
+typedef enum {
+    HeUhfPowerSequenceOtgThenEnable = 0,
+    HeUhfPowerSequenceEnableThenOtg = 1,
+} HeUhfPowerSequence;
+
+typedef enum {
+    HeUhfExchangeNotRun = 0,
+    HeUhfExchangeOk,
+    HeUhfExchangeNoRx,
+    HeUhfExchangeBadFrame,
+    HeUhfExchangeWrongFrame,
+    HeUhfExchangeTimeout,
+} HeUhfExchangeStatus;
+
+typedef enum {
+    HeNo5vOverallIdle = 0,
+    HeNo5vOverallPass,
+    HeNo5vOverallNotApplicable,
+    HeNo5vOverallExternalVbusPresent,
+    HeNo5vOverallNoPower,
+    HeNo5vOverallNoModule,
+    HeNo5vOverallExerciseFailed,
+    HeNo5vOverallSaveFailed,
+} HeNo5vOverall;
+
+typedef enum {
+    HeNo5vStepNotRun = 0,
+    HeNo5vStepOk,
+    HeNo5vStepFailed,
+    HeNo5vStepTimeout,
+} HeNo5vStepStatus;
+
+typedef struct {
+    uint8_t board_class;
+    uint8_t pa4_high;
+    uint8_t pc1_high;
+    uint8_t pc0_high;
+    uint8_t pc3_level;
+    uint8_t otg_enabled;
+    uint8_t otg_fault;
+    uint16_t vbus_mv;
+} HeBoardSnapshot;
+
+typedef struct {
+    HeUhfExchangeStatus status;
+    uint16_t rx_bytes;
+    uint16_t valid_frames;
+    uint16_t wrong_frames;
+    uint16_t checksum_failures;
+    uint16_t bad_frames;
+    uint8_t first_rx[HE_UHF_RX_EVIDENCE_MAX];
+    uint8_t first_rx_len;
+} HeUhfExchangeEvidence;
+
+typedef struct {
+    HeNo5vOverall overall;
+    HeBoardSnapshot pre;
+    HeBoardSnapshot post_enable;
+    HeBoardSnapshot final;
+    HeUhfPowerSequence power_sequence;
+    bool external_vbus_present;
+    bool power_available;
+    bool power_owned;
+    uint8_t presence;
+    uint8_t family;
+    uint8_t hardware_class;
+    char hw_version[24];
+    char sw_version[24];
+    HeNo5vStepStatus version_status;
+    HeNo5vStepStatus rf_off_1_status;
+    HeNo5vStepStatus rf_on_status;
+    HeNo5vStepStatus single_poll_status;
+    HeNo5vStepStatus rf_off_2_status;
+    HeNo5vStepStatus hibernate_status;
+    bool saved;
+    HeUhfExchangeEvidence version_exchange;
+    uint8_t version_payload[HE_UHF_RX_MAX];
+    size_t version_payload_len;
+    uint8_t single_poll_payload[HE_UHF_RX_MAX];
+    size_t single_poll_payload_len;
+} HeNo5vResult;
 
 /*
  * SAM-side protocol scratch is persistent and heap-owned.
@@ -184,6 +295,9 @@ typedef struct {
     uint8_t uart_isr_buf[FURI_HAL_SERIAL_DMA_BUFFER_SIZE];
 } HeBridge;
 
+static bool he_bridge_start(HeBridge* bridge);
+static bool he_bridge_stop(HeBridge* bridge);
+
 /* App-wide state shared between the two bridges and the simple status UI. */
 struct HardwareExerciserApp {
     Gui* gui;
@@ -202,6 +316,18 @@ struct HardwareExerciserApp {
     bool shutdown_failed;
     uint8_t shutdown_failed_vcp;
     HeBridgeStopStatus shutdown_failed_status;
+    bool uhf_power_enabled;
+    bool uhf_power_owned;
+    bool uhf_bridge_enabled;
+    bool uhf_bridge_forced;
+    uint8_t uhf_presence;
+    HxUhfProfile uhf_profile;
+    char uhf_hw_version[24];
+    char uhf_sw_version[24];
+    bool no5v_running;
+    bool no5v_has_result;
+    char no5v_phase[24];
+    HeNo5vResult no5v_result;
 #if HE_DEBUG_TRACE
     HeDiagEvent diag[HE_DIAG_CAPACITY];
     uint16_t diag_read;
@@ -276,7 +402,22 @@ static const uint32_t he_caps =
     HX_CAP_PING | HX_CAP_GET_CAPS | HX_CAP_GET_STATUS | HX_CAP_HF14A_SCAN | HX_CAP_HF14A_TXRX |
     HX_CAP_HF15693_SCAN | HX_CAP_HF15693_TXRX | HX_CAP_LF_READ_DECODED |
     HX_CAP_GPIO_LIST_PINS | HX_CAP_GPIO_CONFIGURE | HX_CAP_GPIO_WRITE | HX_CAP_GPIO_READ |
-    HX_CAP_GPIO_READ_ANALOG | HX_CAP_GPIO_VECTOR | HX_CAP_GPIO_RESET | HX_CAP_QUIT;
+    HX_CAP_GPIO_READ_ANALOG | HX_CAP_GPIO_VECTOR | HX_CAP_GPIO_RESET | HX_CAP_QUIT |
+    HX_CAP_BOARD_SNAPSHOT | HX_CAP_UHF_POWER | HX_CAP_UHF_PROBE | HX_CAP_UHF_BRIDGE |
+    HX_CAP_UHF_NO5V_TEST;
+
+static const uint8_t he_uhf_cmd_hw_version[] =
+    {0xBB, 0x00, 0x03, 0x00, 0x01, 0x00, 0x04, 0x7E};
+static const uint8_t he_uhf_cmd_sw_version[] =
+    {0xBB, 0x00, 0x03, 0x00, 0x01, 0x01, 0x05, 0x7E};
+static const uint8_t he_uhf_cmd_hibernate[] =
+    {0xBB, 0x00, 0x17, 0x00, 0x00, 0x17, 0x7E};
+static const uint8_t he_uhf_cmd_rf_off[] =
+    {0xBB, 0x00, 0xB0, 0x00, 0x01, 0x00, 0xB1, 0x7E};
+static const uint8_t he_uhf_cmd_rf_on[] =
+    {0xBB, 0x00, 0xB0, 0x00, 0x01, 0xFF, 0xB0, 0x7E};
+static const uint8_t he_uhf_cmd_single_poll[] =
+    {0xBB, 0x00, 0x22, 0x00, 0x00, 0x22, 0x7E};
 
 #define HE_BRIDGE_INIT_READY_FLAG (1U << 0)
 
@@ -320,6 +461,28 @@ static const char* he_thread_state_label(FuriThreadState state) {
         return "running";
     default:
         return "unknown";
+    }
+}
+
+static const char* he_no5v_overall_label(HeNo5vOverall overall) {
+    switch(overall) {
+    case HeNo5vOverallPass:
+        return "PASS";
+    case HeNo5vOverallNotApplicable:
+        return "Not UHF carrier";
+    case HeNo5vOverallExternalVbusPresent:
+        return "External 5V present";
+    case HeNo5vOverallNoPower:
+        return "No UHF power";
+    case HeNo5vOverallNoModule:
+        return "No UHF module";
+    case HeNo5vOverallExerciseFailed:
+        return "Exercise failed";
+    case HeNo5vOverallSaveFailed:
+        return "Save failed";
+    case HeNo5vOverallIdle:
+    default:
+        return "Not run";
     }
 }
 
@@ -584,12 +747,48 @@ static void he_view_draw_callback(Canvas* canvas, void* context) {
         canvas_draw_str(canvas, 2, 63, "Back to retry exit");
         return;
     }
+    if(app->no5v_running || app->no5v_has_result) {
+        char line[40];
+        canvas_set_font(canvas, FontSecondary);
+        if(app->no5v_running) {
+            canvas_draw_str(canvas, 2, 24, "Battery UHF test");
+            snprintf(line, sizeof(line), "Phase: %s", app->no5v_phase);
+            canvas_draw_str(canvas, 2, 36, line);
+            canvas_draw_str(canvas, 2, 50, "Please wait...");
+            canvas_draw_str(canvas, 2, 63, "Running...");
+            return;
+        }
+
+        canvas_draw_str(canvas, 2, 24, "No-5V UHF result");
+        canvas_draw_str(canvas, 2, 36, he_no5v_overall_label(app->no5v_result.overall));
+        snprintf(
+            line,
+            sizeof(line),
+            "PC3 %u VBUS %umV",
+            app->no5v_result.final.pc3_level,
+            app->no5v_result.final.vbus_mv);
+        canvas_draw_str(canvas, 2, 48, line);
+        canvas_draw_str(
+            canvas,
+            2,
+            60,
+            app->no5v_result.saved ? "Saved. OK rerun Back exit" : "Not saved. OK rerun");
+        return;
+    }
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 2, 24, "CDC0: SAM + Escape");
-    canvas_draw_str(canvas, 2, 34, "CDC1: UHF Raw");
-    canvas_draw_str(canvas, 2, 44, "115200 baud");
+    char line[40];
+    if(app->uhf_presence == HxUhfModulePresencePresent) {
+        snprintf(line, sizeof(line), "UHF: %s", app->uhf_hw_version[0] ? app->uhf_hw_version : "present");
+    } else if(app->uhf_presence == HxUhfModulePresenceAbsent) {
+        snprintf(line, sizeof(line), "UHF: not detected");
+    } else {
+        snprintf(line, sizeof(line), "UHF: unknown");
+    }
+    canvas_draw_str(canvas, 2, 34, line);
+    canvas_draw_str(canvas, 2, 44, app->uhf_bridge_enabled ? "CDC1: UHF Raw" : "CDC1: disabled");
     canvas_draw_str(canvas, 2, 54, app->sam_bridge.cdc_connected ? "SAM host: connected" : "SAM host: idle");
-    canvas_draw_str(canvas, 2, 63, app->uhf_bridge.cdc_connected ? "UHF host: connected" : "UHF host: idle");
+    canvas_draw_str(canvas, 2, 63, "OK no5V  Back exit");
 }
 
 static void he_view_input_callback(InputEvent* input_event, void* context) {
@@ -649,6 +848,1077 @@ static void he_bridge_reset_session(HeBridge* bridge) {
     }
 }
 
+static uint16_t he_vbus_mv_from_volts(float vbus_voltage) {
+    if(vbus_voltage <= 0.0f) {
+        return 0U;
+    }
+
+    const float scaled_mv = (vbus_voltage * 1000.0f) + 0.5f;
+    if(scaled_mv >= 65535.0f) {
+        return UINT16_MAX;
+    }
+
+    return (uint16_t)scaled_mv;
+}
+
+static uint16_t he_current_vbus_mv(void) {
+    return he_vbus_mv_from_volts(furi_hal_power_get_usb_voltage());
+}
+
+static bool he_probe_pin_pulldown_high(const GpioPin* pin) {
+    if(!pin) {
+        return false;
+    }
+
+    furi_hal_gpio_init(pin, GpioModeInput, GpioPullDown, GpioSpeedLow);
+    furi_delay_ms(2U);
+    const bool is_high = furi_hal_gpio_read(pin);
+    furi_hal_gpio_init(pin, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
+    return is_high;
+}
+
+static uint8_t he_detect_board_class(bool* pa4_high, bool* pc1_high, bool* pc0_high) {
+    const bool pa4 = he_probe_pin_pulldown_high(&gpio_ext_pa4);
+    bool pc1 = false;
+    bool pc0 = false;
+
+    if(!pa4) {
+        pc1 = he_probe_pin_pulldown_high(&gpio_ext_pc1);
+        pc0 = he_probe_pin_pulldown_high(&gpio_ext_pc0);
+    }
+
+    if(pa4_high) *pa4_high = pa4;
+    if(pc1_high) *pc1_high = pc1;
+    if(pc0_high) *pc0_high = pc0;
+    return hx_board_classify(pa4, pc1, pc0);
+}
+
+static void he_uhf_set_enable_pin(bool enabled) {
+    furi_hal_gpio_init(&gpio_ext_pc3, GpioModeOutputPushPull, GpioPullNo, GpioSpeedLow);
+    furi_hal_gpio_write(&gpio_ext_pc3, enabled);
+}
+
+static void he_uhf_release_enable_pin(void) {
+    furi_hal_gpio_init(&gpio_ext_pc3, GpioModeAnalog, GpioPullNo, GpioSpeedLow);
+}
+
+static size_t
+    he_copy_ascii(char* dst, size_t dst_cap, const uint8_t* src, size_t src_len) {
+    if(!dst || dst_cap == 0U || !src) {
+        return 0U;
+    }
+
+    size_t out = 0U;
+    for(size_t i = 0U; i < src_len && out + 1U < dst_cap; i++) {
+        if(src[i] >= 0x20U && src[i] <= 0x7eU) {
+            dst[out++] = (char)src[i];
+        }
+    }
+    dst[out] = '\0';
+    return out;
+}
+
+static void he_uhf_probe_rx_cb(
+    FuriHalSerialHandle* handle,
+    FuriHalSerialRxEvent event,
+    void* context) {
+    HeUhfProbeSession* session = context;
+    if(!session || !session->rx_active || !(event & FuriHalSerialRxEventData)) {
+        return;
+    }
+
+    if(session->stream_len < sizeof(session->stream)) {
+        session->stream[session->stream_len++] = furi_hal_serial_async_rx(handle);
+    } else {
+        memmove(session->stream, session->stream + 1U, sizeof(session->stream) - 1U);
+        session->stream[sizeof(session->stream) - 1U] = furi_hal_serial_async_rx(handle);
+    }
+
+    while(furi_hal_serial_async_rx_available(handle)) {
+        if(session->stream_len < sizeof(session->stream)) {
+            session->stream[session->stream_len++] = furi_hal_serial_async_rx(handle);
+        } else {
+            memmove(session->stream, session->stream + 1U, sizeof(session->stream) - 1U);
+            session->stream[sizeof(session->stream) - 1U] = furi_hal_serial_async_rx(handle);
+        }
+    };
+}
+
+static bool he_uhf_probe_session_open(HeUhfProbeSession* session) {
+    if(!session || session->handle || furi_hal_serial_control_is_busy(FuriHalSerialIdUsart)) {
+        return false;
+    }
+
+    session->handle = furi_hal_serial_control_acquire(FuriHalSerialIdUsart);
+    if(!session->handle) {
+        return false;
+    }
+
+    session->init_by_app = !furi_hal_bus_is_enabled(FuriHalBusUSART1);
+    if(session->init_by_app) {
+        furi_hal_serial_init(session->handle, HE_UHF_UART_BAUDRATE);
+    } else {
+        furi_hal_serial_set_br(session->handle, HE_UHF_UART_BAUDRATE);
+    }
+    session->rx_active = true;
+    session->stream_len = 0U;
+    furi_hal_serial_async_rx_start(session->handle, he_uhf_probe_rx_cb, session, false);
+    return true;
+}
+
+static void he_uhf_probe_session_close(HeUhfProbeSession* session) {
+    if(!session || !session->handle) {
+        return;
+    }
+
+    session->rx_active = false;
+    furi_hal_serial_async_rx_stop(session->handle);
+    if(session->init_by_app) {
+        furi_hal_serial_deinit(session->handle);
+    }
+    furi_hal_serial_control_release(session->handle);
+    memset(session, 0, sizeof(*session));
+}
+
+static void he_uhf_capture_rx_evidence(
+    const HeUhfProbeSession* session,
+    uint8_t expected_type,
+    uint8_t expected_cmd,
+    HeUhfExchangeEvidence* evidence) {
+    if(!evidence) {
+        return;
+    }
+
+    if(!session) {
+        evidence->status = HeUhfExchangeTimeout;
+        return;
+    }
+
+    memset(evidence, 0, sizeof(*evidence));
+    evidence->status = HeUhfExchangeTimeout;
+    evidence->rx_bytes = session->stream_len > UINT16_MAX ? UINT16_MAX : (uint16_t)session->stream_len;
+    evidence->first_rx_len = session->stream_len < sizeof(evidence->first_rx) ?
+                                 (uint8_t)session->stream_len :
+                                 (uint8_t)sizeof(evidence->first_rx);
+    if(evidence->first_rx_len > 0U) {
+        memcpy(evidence->first_rx, session->stream, evidence->first_rx_len);
+    } else {
+        evidence->status = HeUhfExchangeNoRx;
+        return;
+    }
+
+    size_t offset = 0U;
+    while(offset + 7U <= session->stream_len) {
+        if(session->stream[offset] != 0xbbU) {
+            evidence->bad_frames++;
+            offset++;
+            continue;
+        }
+
+        const size_t payload_len =
+            ((size_t)session->stream[offset + 3U] << 8U) | session->stream[offset + 4U];
+        const size_t frame_len = payload_len + 7U;
+        if(offset + frame_len > session->stream_len) {
+            evidence->bad_frames++;
+            offset++;
+            continue;
+        }
+        if(session->stream[offset + frame_len - 1U] != 0x7eU) {
+            evidence->bad_frames++;
+            offset++;
+            continue;
+        }
+        if(hx_uhf_frame_checksum(session->stream + offset + 1U, frame_len - 3U) !=
+           session->stream[offset + frame_len - 2U]) {
+            evidence->checksum_failures++;
+            offset++;
+            continue;
+        }
+
+        evidence->valid_frames++;
+        if(session->stream[offset + 1U] != expected_type ||
+           session->stream[offset + 2U] != expected_cmd) {
+            evidence->wrong_frames++;
+        }
+        offset += frame_len;
+    }
+
+    if(evidence->valid_frames > 0U && evidence->wrong_frames == evidence->valid_frames) {
+        evidence->status = HeUhfExchangeWrongFrame;
+    } else if(evidence->checksum_failures > 0U || evidence->bad_frames > 0U) {
+        evidence->status = HeUhfExchangeBadFrame;
+    }
+}
+
+static bool he_uhf_send_expect_timeout(
+    HeUhfProbeSession* session,
+    const uint8_t* tx,
+    size_t tx_len,
+    uint8_t expected_type,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len,
+    HeUhfExchangeEvidence* evidence,
+    uint16_t timeout_ms) {
+    if(!session || !session->handle || !tx || tx_len == 0U || !payload || !payload_len) {
+        return false;
+    }
+
+    session->stream_len = 0U;
+    memset(session->stream, 0, sizeof(session->stream));
+    if(evidence) {
+        memset(evidence, 0, sizeof(*evidence));
+        evidence->status = HeUhfExchangeNotRun;
+    }
+    furi_hal_serial_tx(session->handle, tx, tx_len);
+    furi_hal_serial_tx_wait_complete(session->handle);
+
+    uint32_t waited = 0U;
+    while(waited <= timeout_ms) {
+        if(hx_uhf_try_parse_frame(
+               session->stream,
+               session->stream_len,
+               expected_type,
+               expected_cmd,
+               payload,
+               payload_cap,
+               payload_len)) {
+            if(evidence) {
+                he_uhf_capture_rx_evidence(session, expected_type, expected_cmd, evidence);
+                evidence->status = HeUhfExchangeOk;
+            }
+            return true;
+        }
+        furi_delay_ms(HE_UHF_PROBE_STEP_MS);
+        waited += HE_UHF_PROBE_STEP_MS;
+    }
+
+    if(evidence) {
+        he_uhf_capture_rx_evidence(session, expected_type, expected_cmd, evidence);
+    }
+    return false;
+}
+
+static bool he_uhf_send_expect(
+    HeUhfProbeSession* session,
+    const uint8_t* tx,
+    size_t tx_len,
+    uint8_t expected_type,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len,
+    HeUhfExchangeEvidence* evidence) {
+    return he_uhf_send_expect_timeout(
+        session,
+        tx,
+        tx_len,
+        expected_type,
+        expected_cmd,
+        payload,
+        payload_cap,
+        payload_len,
+        evidence,
+        HE_UHF_PROBE_TIMEOUT_MS);
+}
+
+static void he_uhf_clear_cached_state(HardwareExerciserApp* app) {
+    if(!app) {
+        return;
+    }
+    app->uhf_presence = HxUhfModulePresenceUnknown;
+    app->uhf_profile = hx_uhf_profile_from_versions(NULL, NULL);
+    memset(app->uhf_hw_version, 0, sizeof(app->uhf_hw_version));
+    memset(app->uhf_sw_version, 0, sizeof(app->uhf_sw_version));
+}
+
+static bool he_uhf_power_on_sequence_timed(
+    HardwareExerciserApp* app,
+    HeUhfPowerSequence sequence,
+    uint16_t otg_settle_ms,
+    uint16_t pc3_settle_ms) {
+    if(!app) {
+        return false;
+    }
+    if(app->uhf_power_enabled) {
+        he_uhf_set_enable_pin(true);
+        return true;
+    }
+
+    const bool otg_already_enabled = furi_hal_power_is_otg_enabled();
+    const bool external_vbus_present = he_current_vbus_mv() >= HE_UHF_POWER_AVAILABLE_MV;
+    app->uhf_power_owned = false;
+
+    he_log_tag(
+        "HEUHF",
+        "power seq=%u start otg=%u ext_vbus=%u vbus_mv=%u otg_settle=%u pc3_settle=%u",
+        sequence,
+        otg_already_enabled ? 1U : 0U,
+        external_vbus_present ? 1U : 0U,
+        he_current_vbus_mv(),
+        otg_settle_ms,
+        pc3_settle_ms);
+
+    if(sequence == HeUhfPowerSequenceOtgThenEnable) {
+        he_uhf_set_enable_pin(false);
+        if(!otg_already_enabled && !external_vbus_present) {
+            (void)furi_hal_power_enable_otg();
+        }
+        furi_delay_ms(otg_settle_ms);
+        app->uhf_power_owned =
+            !otg_already_enabled && !external_vbus_present && furi_hal_power_is_otg_enabled();
+        he_uhf_set_enable_pin(true);
+        furi_delay_ms(pc3_settle_ms);
+    } else {
+        he_uhf_set_enable_pin(true);
+        furi_delay_ms(pc3_settle_ms);
+        if(!otg_already_enabled && !external_vbus_present) {
+            (void)furi_hal_power_enable_otg();
+        }
+        furi_delay_ms(otg_settle_ms);
+        app->uhf_power_owned =
+            !otg_already_enabled && !external_vbus_present && furi_hal_power_is_otg_enabled();
+    }
+
+    const bool otg_enabled = furi_hal_power_is_otg_enabled();
+    const uint16_t vbus_mv = he_current_vbus_mv();
+    if(!otg_enabled && vbus_mv < HE_UHF_POWER_AVAILABLE_MV) {
+        he_log_tag(
+            "HEUHF",
+            "power seq=%u no power otg=%u vbus_mv=%u",
+            sequence,
+            otg_enabled ? 1U : 0U,
+            vbus_mv);
+        he_uhf_set_enable_pin(false);
+        app->uhf_power_enabled = false;
+        app->uhf_power_owned = false;
+        return false;
+    }
+
+    if(furi_hal_power_check_otg_fault()) {
+        he_log_tag("HEUHF", "power seq=%u otg fault", sequence);
+        he_uhf_set_enable_pin(false);
+        if(app->uhf_power_owned && furi_hal_power_is_otg_enabled()) {
+            furi_hal_power_disable_otg();
+        }
+        app->uhf_power_enabled = false;
+        app->uhf_power_owned = false;
+        return false;
+    }
+
+    app->uhf_power_enabled = true;
+    he_log_tag(
+        "HEUHF",
+        "power seq=%u ok otg=%u owned=%u pc3=%u vbus_mv=%u",
+        sequence,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        app->uhf_power_owned ? 1U : 0U,
+        furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U,
+        he_current_vbus_mv());
+    return true;
+}
+
+static bool he_uhf_power_on_sequence(HardwareExerciserApp* app, HeUhfPowerSequence sequence) {
+    const uint16_t pc3_settle =
+        sequence == HeUhfPowerSequenceOtgThenEnable ? HE_UHF_ENABLE_SETTLE_MS : 50U;
+    const uint16_t otg_settle =
+        sequence == HeUhfPowerSequenceOtgThenEnable ? HE_UHF_POWER_SETTLE_MS : HE_UHF_ALT_SETTLE_MS;
+    return he_uhf_power_on_sequence_timed(app, sequence, otg_settle, pc3_settle);
+}
+
+static bool he_uhf_power_on(HardwareExerciserApp* app) {
+    return he_uhf_power_on_sequence(app, HeUhfPowerSequenceOtgThenEnable);
+}
+
+static void he_uhf_power_off(HardwareExerciserApp* app) {
+    if(!app) {
+        return;
+    }
+
+    he_log_tag(
+        "HEUHF",
+        "power off enabled=%u owned=%u otg=%u pc3=%u vbus_mv=%u",
+        app->uhf_power_enabled ? 1U : 0U,
+        app->uhf_power_owned ? 1U : 0U,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U,
+        he_current_vbus_mv());
+    he_uhf_set_enable_pin(false);
+    if(app->uhf_power_enabled && app->uhf_power_owned && furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+    }
+    app->uhf_power_enabled = false;
+    app->uhf_power_owned = false;
+    furi_delay_ms(HE_UHF_CLOSE_SETTLE_MS);
+}
+
+static void he_uhf_transport_reset(HardwareExerciserApp* app, uint16_t off_ms) {
+    if(!app) {
+        return;
+    }
+
+    he_log_tag(
+        "HEUHF",
+        "transport reset begin off_ms=%u bridge=%u otg=%u pc3=%u vbus_mv=%u",
+        off_ms,
+        app->uhf_bridge_enabled ? 1U : 0U,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U,
+        he_current_vbus_mv());
+    if(app->uhf_bridge_enabled) {
+        (void)he_bridge_stop(&app->uhf_bridge);
+        app->uhf_bridge_enabled = false;
+        app->uhf_bridge_forced = false;
+    }
+
+    he_uhf_set_enable_pin(false);
+    furi_delay_ms(HE_UHF_RESET_PIN_LOW_MS);
+    if(furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+    }
+    app->uhf_power_enabled = false;
+    app->uhf_power_owned = false;
+    he_uhf_release_enable_pin();
+    he_gpio_reset_all(&app->gpio);
+    he_uhf_clear_cached_state(app);
+    furi_delay_ms(off_ms);
+    he_log_tag(
+        "HEUHF",
+        "transport reset end otg=%u pc3=%u vbus_mv=%u",
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U,
+        he_current_vbus_mv());
+}
+
+static bool he_uhf_hibernate(HardwareExerciserApp* app) {
+    uint8_t payload[HE_UHF_RX_MAX] = {0};
+    size_t payload_len = 0U;
+    HeUhfProbeSession session = {0};
+    bool ok = false;
+
+    if(!app || !he_uhf_power_on(app)) {
+        return false;
+    }
+    if(!he_uhf_probe_session_open(&session)) {
+        he_uhf_power_off(app);
+        return false;
+    }
+
+    (void)he_uhf_send_expect(
+        &session,
+        he_uhf_cmd_rf_off,
+        sizeof(he_uhf_cmd_rf_off),
+        0x01U,
+        0xb0U,
+        payload,
+        sizeof(payload),
+        &payload_len,
+        NULL);
+    furi_delay_ms(HE_UHF_CLOSE_SETTLE_MS);
+    ok = he_uhf_send_expect(
+        &session,
+        he_uhf_cmd_hibernate,
+        sizeof(he_uhf_cmd_hibernate),
+        0x01U,
+        0x17U,
+        payload,
+        sizeof(payload),
+        &payload_len,
+        NULL);
+    he_uhf_probe_session_close(&session);
+    he_uhf_power_off(app);
+    return ok;
+}
+
+static bool he_uhf_probe_versions(
+    uint8_t* hw_payload,
+    size_t hw_payload_cap,
+    size_t* hw_payload_len,
+    uint8_t* sw_payload,
+    size_t sw_payload_cap,
+    size_t* sw_payload_len,
+    HeUhfExchangeEvidence* first_hw_exchange) {
+    bool detected = false;
+
+    if(hw_payload_len) *hw_payload_len = 0U;
+    if(sw_payload_len) *sw_payload_len = 0U;
+
+    for(uint8_t attempt = 0U; attempt < HE_UHF_DETECT_ATTEMPTS; attempt++) {
+        HeUhfProbeSession session = {0};
+        if(!he_uhf_probe_session_open(&session)) {
+            he_log_tag("HEUHF", "probe attempt=%u open failed", attempt + 1U);
+            furi_delay_ms(HE_UHF_DETECT_RETRY_MS);
+            continue;
+        }
+
+        HeUhfExchangeEvidence local_evidence = {0};
+        HeUhfExchangeEvidence* evidence =
+            first_hw_exchange ? ((attempt == 0U) ? first_hw_exchange : NULL) : &local_evidence;
+        const bool hw_ok = he_uhf_send_expect(
+            &session,
+            he_uhf_cmd_hw_version,
+            sizeof(he_uhf_cmd_hw_version),
+            0x01U,
+            0x03U,
+            hw_payload,
+            hw_payload_cap,
+            hw_payload_len,
+            evidence);
+        he_log_tag(
+            "HEUHF",
+            "probe attempt=%u hw_ok=%u hw_len=%u ex=%u rx=%u valid=%u wrong=%u csum=%u bad=%u",
+            attempt + 1U,
+            hw_ok ? 1U : 0U,
+            hw_payload_len ? (unsigned)*hw_payload_len : 0U,
+            evidence ? evidence->status : 0U,
+            evidence ? evidence->rx_bytes : 0U,
+            evidence ? evidence->valid_frames : 0U,
+            evidence ? evidence->wrong_frames : 0U,
+            evidence ? evidence->checksum_failures : 0U,
+            evidence ? evidence->bad_frames : 0U);
+        furi_delay_ms(10U);
+        const bool sw_ok = he_uhf_send_expect(
+            &session,
+            he_uhf_cmd_sw_version,
+            sizeof(he_uhf_cmd_sw_version),
+            0x01U,
+            0x03U,
+            sw_payload,
+            sw_payload_cap,
+            sw_payload_len,
+            NULL);
+        he_log_tag(
+            "HEUHF",
+            "probe attempt=%u sw_ok=%u sw_len=%u",
+            attempt + 1U,
+            sw_ok ? 1U : 0U,
+            sw_payload_len ? (unsigned)*sw_payload_len : 0U);
+        he_uhf_probe_session_close(&session);
+
+        detected = hw_ok || sw_ok;
+        if(detected) {
+            break;
+        }
+        furi_delay_ms(HE_UHF_DETECT_RETRY_MS);
+    }
+
+    return detected;
+}
+
+static bool he_uhf_refresh_presence(HardwareExerciserApp* app) {
+    uint8_t hw_payload[HE_UHF_RX_MAX] = {0};
+    uint8_t sw_payload[HE_UHF_RX_MAX] = {0};
+    size_t hw_payload_len = 0U;
+    size_t sw_payload_len = 0U;
+    bool detected = false;
+    bool temporary_power = false;
+
+    if(!app) {
+        return false;
+    }
+
+    bool pa4_high = false;
+    bool pc1_high = false;
+    bool pc0_high = false;
+    const uint8_t board_class = he_detect_board_class(&pa4_high, &pc1_high, &pc0_high);
+    he_log_tag(
+        "HEUHF",
+        "refresh begin board=%u pa4=%u pc1=%u pc0=%u otg=%u pc3=%u vbus_mv=%u",
+        board_class,
+        pa4_high ? 1U : 0U,
+        pc1_high ? 1U : 0U,
+        pc0_high ? 1U : 0U,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U,
+        he_current_vbus_mv());
+
+    if(board_class != HxBoardClassUhfCarrier) {
+        he_uhf_clear_cached_state(app);
+        app->uhf_presence = HxUhfModulePresenceAbsent;
+        he_log_tag("HEUHF", "refresh skip non-uhf board=%u", board_class);
+        return false;
+    }
+
+    memset(app->uhf_hw_version, 0, sizeof(app->uhf_hw_version));
+    memset(app->uhf_sw_version, 0, sizeof(app->uhf_sw_version));
+    app->uhf_presence = HxUhfModulePresenceAbsent;
+    app->uhf_profile = hx_uhf_profile_from_versions(NULL, NULL);
+
+    temporary_power = !app->uhf_power_enabled;
+    if(temporary_power) {
+        he_uhf_transport_reset(app, HE_UHF_RESET_DEFAULT_OFF_MS);
+    }
+    if(!he_uhf_power_on(app)) {
+        he_log_tag("HEUHF", "refresh primary power failed");
+        return false;
+    }
+
+    he_log_tag("HEUHF", "refresh primary probe start");
+    detected = he_uhf_probe_versions(
+        hw_payload,
+        sizeof(hw_payload),
+        &hw_payload_len,
+        sw_payload,
+        sizeof(sw_payload),
+        &sw_payload_len,
+        NULL);
+
+    if(!detected && temporary_power) {
+        he_log_tag("HEUHF", "refresh primary probe failed; trying alt sequence");
+        he_uhf_power_off(app);
+        if(he_uhf_power_on_sequence(app, HeUhfPowerSequenceEnableThenOtg)) {
+            he_log_tag("HEUHF", "refresh alt probe start");
+            detected = he_uhf_probe_versions(
+                hw_payload,
+                sizeof(hw_payload),
+                &hw_payload_len,
+                sw_payload,
+                sizeof(sw_payload),
+                &sw_payload_len,
+                NULL);
+        } else {
+            he_log_tag("HEUHF", "refresh alt power failed");
+        }
+    }
+
+    if(!detected) {
+        app->uhf_presence = HxUhfModulePresenceAbsent;
+        if(temporary_power) {
+            he_uhf_power_off(app);
+        }
+        he_log_tag("HEUHF", "refresh final absent");
+        return false;
+    }
+
+    he_copy_ascii(
+        app->uhf_hw_version, sizeof(app->uhf_hw_version), hw_payload, hw_payload_len);
+    he_copy_ascii(
+    app->uhf_sw_version, sizeof(app->uhf_sw_version), sw_payload, sw_payload_len);
+    app->uhf_profile = hx_uhf_profile_from_versions(app->uhf_hw_version, app->uhf_sw_version);
+    app->uhf_presence = HxUhfModulePresencePresent;
+    he_log_tag(
+        "HEUHF",
+        "refresh final present hw=%s sw=%s family=%u class=%u",
+        app->uhf_hw_version,
+        app->uhf_sw_version,
+        app->uhf_profile.family,
+        app->uhf_profile.hardware_class);
+    return true;
+}
+
+static void he_no5v_set_phase(HardwareExerciserApp* app, const char* phase) {
+    if(!app) {
+        return;
+    }
+    snprintf(app->no5v_phase, sizeof(app->no5v_phase), "%s", phase ? phase : "");
+    app->ui_dirty = true;
+    view_port_update(app->view_port);
+}
+
+static HeBoardSnapshot he_capture_board_snapshot(void) {
+    HeBoardSnapshot snapshot = {0};
+    bool pa4_high = false;
+    bool pc1_high = false;
+    bool pc0_high = false;
+
+    snapshot.board_class = he_detect_board_class(&pa4_high, &pc1_high, &pc0_high);
+    snapshot.pa4_high = pa4_high ? 1U : 0U;
+    snapshot.pc1_high = pc1_high ? 1U : 0U;
+    snapshot.pc0_high = pc0_high ? 1U : 0U;
+    snapshot.pc3_level = furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U;
+    snapshot.otg_enabled = furi_hal_power_is_otg_enabled() ? 1U : 0U;
+    snapshot.otg_fault = furi_hal_power_check_otg_fault() ? 1U : 0U;
+    snapshot.vbus_mv = he_current_vbus_mv();
+    return snapshot;
+}
+
+static void he_no5v_copy_hex(
+    const uint8_t* data,
+    size_t data_len,
+    char* out,
+    size_t out_cap) {
+    static const char hex[] = "0123456789abcdef";
+    if(!out || out_cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if(!data || data_len == 0U) {
+        return;
+    }
+
+    const size_t max_bytes = (out_cap - 1U) / 2U;
+    const size_t bytes = data_len < max_bytes ? data_len : max_bytes;
+    for(size_t i = 0U; i < bytes; i++) {
+        out[i * 2U] = hex[data[i] >> 4U];
+        out[i * 2U + 1U] = hex[data[i] & 0x0fU];
+    }
+    out[bytes * 2U] = '\0';
+}
+
+static bool he_no5v_write_uint32(FlipperFormat* file, const char* key, uint32_t value) {
+    return flipper_format_write_uint32(file, key, &value, 1U);
+}
+
+static bool he_no5v_save_result(const HeNo5vResult* result) {
+    if(!result) {
+        return false;
+    }
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage) {
+        return false;
+    }
+
+    storage_simply_mkdir(storage, STORAGE_APP_DATA_PATH_PREFIX);
+    FlipperFormat* file = flipper_format_file_alloc(storage);
+    bool ok = false;
+    char version_hex[(HE_NO5V_RESPONSE_HEX_MAX * 2U) + 1U] = {0};
+    char poll_hex[(HE_NO5V_RESPONSE_HEX_MAX * 2U) + 1U] = {0};
+    char first_rx_hex[(HE_UHF_RX_EVIDENCE_MAX * 2U) + 1U] = {0};
+
+    he_no5v_copy_hex(
+        result->version_payload,
+        result->version_payload_len,
+        version_hex,
+        sizeof(version_hex));
+    he_no5v_copy_hex(
+        result->single_poll_payload,
+        result->single_poll_payload_len,
+        poll_hex,
+        sizeof(poll_hex));
+    he_no5v_copy_hex(
+        result->version_exchange.first_rx,
+        result->version_exchange.first_rx_len,
+        first_rx_hex,
+        sizeof(first_rx_hex));
+
+    do {
+        if(!file) break;
+        if(!flipper_format_file_open_always(file, HE_NO5V_REPORT_FILE)) break;
+        if(!flipper_format_write_header_cstr(file, "Hardware Exerciser UHF No5V", 1U)) break;
+        if(!he_no5v_write_uint32(file, "Overall", result->overall)) break;
+        if(!he_no5v_write_uint32(file, "Power Sequence", result->power_sequence)) break;
+        if(!he_no5v_write_uint32(file, "External VBUS Present", result->external_vbus_present ? 1U : 0U)) break;
+        if(!he_no5v_write_uint32(file, "Power Available", result->power_available ? 1U : 0U)) break;
+        if(!he_no5v_write_uint32(file, "Power Owned", result->power_owned ? 1U : 0U)) break;
+        if(!he_no5v_write_uint32(file, "Board Class", result->pre.board_class)) break;
+        if(!he_no5v_write_uint32(file, "PA4 High", result->pre.pa4_high)) break;
+        if(!he_no5v_write_uint32(file, "PC1 High", result->pre.pc1_high)) break;
+        if(!he_no5v_write_uint32(file, "PC0 High", result->pre.pc0_high)) break;
+        if(!he_no5v_write_uint32(file, "Pre PC3", result->pre.pc3_level)) break;
+        if(!he_no5v_write_uint32(file, "Pre OTG", result->pre.otg_enabled)) break;
+        if(!he_no5v_write_uint32(file, "Pre OTG Fault", result->pre.otg_fault)) break;
+        if(!he_no5v_write_uint32(file, "Pre VBUS mV", result->pre.vbus_mv)) break;
+        if(!he_no5v_write_uint32(file, "Post PC3", result->post_enable.pc3_level)) break;
+        if(!he_no5v_write_uint32(file, "Post OTG", result->post_enable.otg_enabled)) break;
+        if(!he_no5v_write_uint32(file, "Post OTG Fault", result->post_enable.otg_fault)) break;
+        if(!he_no5v_write_uint32(file, "Post VBUS mV", result->post_enable.vbus_mv)) break;
+        if(!he_no5v_write_uint32(file, "Final PC3", result->final.pc3_level)) break;
+        if(!he_no5v_write_uint32(file, "Final OTG", result->final.otg_enabled)) break;
+        if(!he_no5v_write_uint32(file, "Final OTG Fault", result->final.otg_fault)) break;
+        if(!he_no5v_write_uint32(file, "Final VBUS mV", result->final.vbus_mv)) break;
+        if(!he_no5v_write_uint32(file, "Presence", result->presence)) break;
+        if(!he_no5v_write_uint32(file, "Family", result->family)) break;
+        if(!he_no5v_write_uint32(file, "Hardware Class", result->hardware_class)) break;
+        if(!flipper_format_write_string_cstr(file, "HW Version", result->hw_version)) break;
+        if(!flipper_format_write_string_cstr(file, "SW Version", result->sw_version)) break;
+        if(!he_no5v_write_uint32(file, "Version Step", result->version_status)) break;
+        if(!he_no5v_write_uint32(file, "Version Exchange", result->version_exchange.status)) break;
+        if(!he_no5v_write_uint32(file, "Version RX Bytes", result->version_exchange.rx_bytes)) break;
+        if(!he_no5v_write_uint32(file, "Version Valid Frames", result->version_exchange.valid_frames)) break;
+        if(!he_no5v_write_uint32(file, "Version Wrong Frames", result->version_exchange.wrong_frames)) break;
+        if(!he_no5v_write_uint32(file, "Version Checksum Failures", result->version_exchange.checksum_failures)) break;
+        if(!he_no5v_write_uint32(file, "Version Bad Frames", result->version_exchange.bad_frames)) break;
+        if(!he_no5v_write_uint32(file, "RF Off 1 Step", result->rf_off_1_status)) break;
+        if(!he_no5v_write_uint32(file, "RF On Step", result->rf_on_status)) break;
+        if(!he_no5v_write_uint32(file, "Single Poll Step", result->single_poll_status)) break;
+        if(!he_no5v_write_uint32(file, "RF Off 2 Step", result->rf_off_2_status)) break;
+        if(!he_no5v_write_uint32(file, "Hibernate Step", result->hibernate_status)) break;
+        if(!flipper_format_write_string_cstr(file, "Version Payload Hex", version_hex)) break;
+        if(!flipper_format_write_string_cstr(file, "Version First RX Hex", first_rx_hex)) break;
+        if(!flipper_format_write_string_cstr(file, "Single Poll Payload Hex", poll_hex)) break;
+        ok = true;
+    } while(false);
+
+    if(file) {
+        flipper_format_free(file);
+    }
+    furi_record_close(RECORD_STORAGE);
+    return ok;
+}
+
+static HeNo5vStepStatus he_no5v_send_step(
+    HeUhfProbeSession* session,
+    const uint8_t* command,
+    size_t command_len,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len,
+    HeUhfExchangeEvidence* evidence) {
+    if(payload_len) {
+        *payload_len = 0U;
+    }
+    return he_uhf_send_expect(
+               session,
+               command,
+               command_len,
+               0x01U,
+               expected_cmd,
+               payload,
+               payload_cap,
+               payload_len,
+               evidence) ?
+               HeNo5vStepOk :
+               HeNo5vStepTimeout;
+}
+
+static size_t he_build_no5v_payload(
+    const HeNo5vResult* result,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!result || !out || out_cap < 20U) {
+        return 0U;
+    }
+
+    out[0] = (uint8_t)result->overall;
+    out[1] = result->pre.board_class;
+    out[2] = result->pre.pa4_high;
+    out[3] = result->pre.pc1_high;
+    out[4] = result->pre.pc0_high;
+    out[5] = result->pre.pc3_level;
+    out[6] = (uint8_t)(result->pre.vbus_mv & 0xffU);
+    out[7] = (uint8_t)(result->pre.vbus_mv >> 8U);
+    out[8] = result->post_enable.pc3_level;
+    out[9] = (uint8_t)(result->post_enable.vbus_mv & 0xffU);
+    out[10] = (uint8_t)(result->post_enable.vbus_mv >> 8U);
+    out[11] = result->final.pc3_level;
+    out[12] = (uint8_t)(result->final.vbus_mv & 0xffU);
+    out[13] = (uint8_t)(result->final.vbus_mv >> 8U);
+    out[14] = result->presence;
+    out[15] = result->family;
+    out[16] = result->hardware_class;
+    out[17] = result->external_vbus_present ? 1U : 0U;
+    out[18] = result->power_available ? 1U : 0U;
+    out[19] = result->saved ? 1U : 0U;
+    if(out_cap < 32U) {
+        return 20U;
+    }
+
+    out[20] = (uint8_t)result->power_sequence;
+    out[21] = (uint8_t)result->version_exchange.status;
+    out[22] = (uint8_t)(result->version_exchange.rx_bytes & 0xffU);
+    out[23] = (uint8_t)(result->version_exchange.rx_bytes >> 8U);
+    out[24] = (uint8_t)(result->version_exchange.valid_frames & 0xffU);
+    out[25] = (uint8_t)(result->version_exchange.valid_frames >> 8U);
+    out[26] = (uint8_t)(result->version_exchange.wrong_frames & 0xffU);
+    out[27] = (uint8_t)(result->version_exchange.wrong_frames >> 8U);
+    out[28] = (uint8_t)(result->version_exchange.checksum_failures & 0xffU);
+    out[29] = (uint8_t)(result->version_exchange.checksum_failures >> 8U);
+    out[30] = (uint8_t)(result->version_exchange.bad_frames & 0xffU);
+    out[31] = (uint8_t)(result->version_exchange.bad_frames >> 8U);
+    return 32U;
+}
+
+static HeNo5vResult he_run_no5v_test(HardwareExerciserApp* app, bool update_ui) {
+    HeNo5vResult result = {
+        .overall = HeNo5vOverallExerciseFailed,
+        .version_status = HeNo5vStepNotRun,
+        .rf_off_1_status = HeNo5vStepNotRun,
+        .rf_on_status = HeNo5vStepNotRun,
+        .single_poll_status = HeNo5vStepNotRun,
+        .rf_off_2_status = HeNo5vStepNotRun,
+        .hibernate_status = HeNo5vStepNotRun,
+        .presence = HxUhfModulePresenceUnknown,
+    };
+    HeUhfProbeSession session = {0};
+    uint8_t scratch[HE_UHF_RX_MAX] = {0};
+    size_t scratch_len = 0U;
+    result.power_sequence = HeUhfPowerSequenceOtgThenEnable;
+
+    if(update_ui) he_no5v_set_phase(app, "prepare");
+    if(app->uhf_bridge_enabled) {
+        (void)he_bridge_stop(&app->uhf_bridge);
+        app->uhf_bridge_enabled = false;
+        app->uhf_bridge_forced = false;
+    }
+    he_uhf_power_off(app);
+    result.pre = he_capture_board_snapshot();
+    result.external_vbus_present = result.pre.vbus_mv >= HE_UHF_POWER_AVAILABLE_MV;
+
+    if(result.pre.board_class != HxBoardClassUhfCarrier) {
+        result.overall = HeNo5vOverallNotApplicable;
+        goto cleanup;
+    }
+
+    if(result.external_vbus_present) {
+        result.overall = HeNo5vOverallExternalVbusPresent;
+        goto cleanup;
+    }
+
+    if(update_ui) he_no5v_set_phase(app, "power");
+    if(!he_uhf_power_on_sequence(app, result.power_sequence)) {
+        result.overall = HeNo5vOverallNoPower;
+        goto cleanup;
+    }
+    result.power_owned = app->uhf_power_owned;
+    result.post_enable = he_capture_board_snapshot();
+    result.power_available =
+        result.post_enable.otg_enabled || result.post_enable.vbus_mv >= HE_UHF_POWER_AVAILABLE_MV;
+    if(!result.power_available) {
+        result.overall = HeNo5vOverallNoPower;
+        goto cleanup;
+    }
+
+    if(update_ui) he_no5v_set_phase(app, "version");
+    if(!he_uhf_probe_session_open(&session)) {
+        result.overall = HeNo5vOverallExerciseFailed;
+        goto cleanup;
+    }
+
+    result.version_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_hw_version,
+        sizeof(he_uhf_cmd_hw_version),
+        0x03U,
+        result.version_payload,
+        sizeof(result.version_payload),
+        &result.version_payload_len,
+        &result.version_exchange);
+    if(result.version_status != HeNo5vStepOk) {
+        he_uhf_probe_session_close(&session);
+        he_uhf_power_off(app);
+        result.power_sequence = HeUhfPowerSequenceEnableThenOtg;
+        if(update_ui) he_no5v_set_phase(app, "alt power");
+        if(he_uhf_power_on_sequence(app, result.power_sequence)) {
+            result.power_owned = app->uhf_power_owned;
+            result.post_enable = he_capture_board_snapshot();
+            result.power_available =
+                result.post_enable.otg_enabled ||
+                result.post_enable.vbus_mv >= HE_UHF_POWER_AVAILABLE_MV;
+            if(he_uhf_probe_session_open(&session)) {
+                if(update_ui) he_no5v_set_phase(app, "alt version");
+                result.version_status = he_no5v_send_step(
+                    &session,
+                    he_uhf_cmd_hw_version,
+                    sizeof(he_uhf_cmd_hw_version),
+                    0x03U,
+                    result.version_payload,
+                    sizeof(result.version_payload),
+                    &result.version_payload_len,
+                    &result.version_exchange);
+            }
+        }
+    }
+    if(result.version_status != HeNo5vStepOk) {
+        result.presence = HxUhfModulePresenceAbsent;
+        result.overall = HeNo5vOverallNoModule;
+        goto cleanup;
+    }
+
+    he_copy_ascii(
+        result.hw_version,
+        sizeof(result.hw_version),
+        result.version_payload,
+        result.version_payload_len);
+    result.presence = HxUhfModulePresencePresent;
+
+    if(he_no5v_send_step(
+           &session,
+           he_uhf_cmd_sw_version,
+           sizeof(he_uhf_cmd_sw_version),
+           0x03U,
+           scratch,
+           sizeof(scratch),
+           &scratch_len,
+           NULL) == HeNo5vStepOk) {
+        he_copy_ascii(result.sw_version, sizeof(result.sw_version), scratch, scratch_len);
+    }
+    result.family = hx_uhf_profile_from_versions(result.hw_version, result.sw_version).family;
+    result.hardware_class =
+        hx_uhf_profile_from_versions(result.hw_version, result.sw_version).hardware_class;
+
+    if(update_ui) he_no5v_set_phase(app, "rf off");
+    result.rf_off_1_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_rf_off,
+        sizeof(he_uhf_cmd_rf_off),
+        0xb0U,
+        scratch,
+        sizeof(scratch),
+        &scratch_len,
+        NULL);
+
+    if(update_ui) he_no5v_set_phase(app, "rf on");
+    result.rf_on_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_rf_on,
+        sizeof(he_uhf_cmd_rf_on),
+        0xb0U,
+        scratch,
+        sizeof(scratch),
+        &scratch_len,
+        NULL);
+
+    if(update_ui) he_no5v_set_phase(app, "single poll");
+    result.single_poll_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_single_poll,
+        sizeof(he_uhf_cmd_single_poll),
+        0x22U,
+        result.single_poll_payload,
+        sizeof(result.single_poll_payload),
+        &result.single_poll_payload_len,
+        NULL);
+
+    if(update_ui) he_no5v_set_phase(app, "rf off");
+    result.rf_off_2_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_rf_off,
+        sizeof(he_uhf_cmd_rf_off),
+        0xb0U,
+        scratch,
+        sizeof(scratch),
+        &scratch_len,
+        NULL);
+
+    if(update_ui) he_no5v_set_phase(app, "hibernate");
+    result.hibernate_status = he_no5v_send_step(
+        &session,
+        he_uhf_cmd_hibernate,
+        sizeof(he_uhf_cmd_hibernate),
+        0x17U,
+        scratch,
+        sizeof(scratch),
+        &scratch_len,
+        NULL);
+
+    result.overall =
+        (result.rf_off_1_status == HeNo5vStepOk && result.rf_on_status == HeNo5vStepOk &&
+         result.rf_off_2_status == HeNo5vStepOk && result.hibernate_status == HeNo5vStepOk) ?
+            HeNo5vOverallPass :
+            HeNo5vOverallExerciseFailed;
+
+cleanup:
+    if(session.handle) {
+        he_uhf_probe_session_close(&session);
+    }
+    he_uhf_power_off(app);
+    result.final = he_capture_board_snapshot();
+    if(update_ui) he_no5v_set_phase(app, "save");
+    result.saved = he_no5v_save_result(&result);
+    if(!result.saved && result.overall == HeNo5vOverallPass) {
+        result.overall = HeNo5vOverallSaveFailed;
+    }
+    app->uhf_presence = result.presence;
+    app->uhf_profile.family = result.family;
+    app->uhf_profile.hardware_class = result.hardware_class;
+    snprintf(app->uhf_hw_version, sizeof(app->uhf_hw_version), "%s", result.hw_version);
+    snprintf(app->uhf_sw_version, sizeof(app->uhf_sw_version), "%s", result.sw_version);
+    return result;
+}
+
 static void he_bridge_signal_worker(HeBridge* bridge, uint32_t flags) {
     if(!bridge || !bridge->thread) {
         he_diag_record(bridge ? bridge->app : NULL, bridge ? bridge->vcp_ch : 0xffU, HeDiagSignalThreadFailed, (int32_t)flags, -1);
@@ -702,6 +1972,7 @@ static void he_bridge_on_uart_rx_async(
     }
 
     size_t used = 0U;
+    bridge->uart_isr_buf[used++] = furi_hal_serial_async_rx(handle);
     while(used < sizeof(bridge->uart_isr_buf) && furi_hal_serial_async_rx_available(handle)) {
         bridge->uart_isr_buf[used++] = furi_hal_serial_async_rx(handle);
     }
@@ -1071,7 +2342,7 @@ static HxStatus he_handle_get_caps(uint8_t* out, size_t out_cap, size_t* out_len
 
 static HxStatus
     he_handle_get_status(HardwareExerciserApp* app, uint8_t* out, size_t out_cap, size_t* out_len) {
-    if(out_cap < 4U) {
+    if(out_cap < 8U) {
         *out_len = 0U;
         return HxStatusIoError;
     }
@@ -1080,8 +2351,214 @@ static HxStatus
     out[1] = app->uhf_bridge.cdc_connected ? 1U : 0U;
     out[2] = app->sam_bridge.serial_handle ? 1U : 0U;
     out[3] = app->uhf_bridge.serial_handle ? 1U : 0U;
-    *out_len = 4U;
+    out[4] = app->uhf_presence;
+    out[5] = app->uhf_bridge_enabled ? 1U : 0U;
+    out[6] = app->uhf_bridge_forced ? 1U : 0U;
+    out[7] = app->uhf_power_enabled ? 1U : 0U;
+    *out_len = 8U;
     return HxStatusOk;
+}
+
+static HxStatus he_handle_get_board_snapshot(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    bool pa4_high = false;
+    bool pc1_high = false;
+    bool pc0_high = false;
+
+    if(!app || !request || request->body_len != 0U) {
+        return HxStatusInvalidRequest;
+    }
+
+    const uint8_t board_class = he_detect_board_class(&pa4_high, &pc1_high, &pc0_high);
+    const uint8_t pc3_level = furi_hal_gpio_read(&gpio_ext_pc3) ? 1U : 0U;
+    const size_t len = hx_build_board_snapshot_payload(
+        board_class,
+        pa4_high ? 1U : 0U,
+        pc1_high ? 1U : 0U,
+        pc0_high ? 1U : 0U,
+        pc3_level,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_power_check_otg_fault() ? 1U : 0U,
+        he_current_vbus_mv(),
+        out,
+        out_cap);
+    if(len == 0U) {
+        return HxStatusIoError;
+    }
+
+    *out_len = len;
+    return HxStatusOk;
+}
+
+static HxStatus he_handle_uhf_power(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    HxUhfPowerRequest parsed = {0};
+
+    if(!app || !hx_parse_uhf_power_request(request->body, request->body_len, &parsed)) {
+        return HxStatusInvalidRequest;
+    }
+
+    HxStatus status = HxStatusOk;
+    if(parsed.action == HxUhfPowerActionOff) {
+        if(app->uhf_bridge_enabled && !he_bridge_stop(&app->uhf_bridge)) {
+            status = HxStatusIoError;
+        } else {
+            app->uhf_bridge_enabled = false;
+            app->uhf_bridge_forced = false;
+            he_uhf_power_off(app);
+        }
+    } else if(parsed.action == HxUhfPowerActionOn) {
+        status = he_uhf_power_on(app) ? HxStatusOk : HxStatusIoError;
+    } else if(parsed.action == HxUhfPowerActionHibernate) {
+        if(app->uhf_bridge_enabled && !he_bridge_stop(&app->uhf_bridge)) {
+            status = HxStatusIoError;
+        } else {
+            app->uhf_bridge_enabled = false;
+            app->uhf_bridge_forced = false;
+            status = he_uhf_hibernate(app) ? HxStatusOk : HxStatusIoError;
+        }
+    }
+
+    const size_t len = hx_build_uhf_power_payload(
+        app->uhf_power_enabled ? 1U : 0U,
+        furi_hal_power_is_otg_enabled() ? 1U : 0U,
+        furi_hal_power_check_otg_fault() ? 1U : 0U,
+        he_current_vbus_mv(),
+        out,
+        out_cap);
+    if(len == 0U) {
+        return HxStatusIoError;
+    }
+
+    *out_len = len;
+    return status;
+}
+
+static HxStatus he_handle_uhf_probe(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    if(!app || !request || request->body_len != 0U) {
+        return HxStatusInvalidRequest;
+    }
+
+    const bool restart_bridge = app->uhf_bridge_enabled;
+    const bool forced = app->uhf_bridge_forced;
+    if(app->uhf_bridge_enabled && !he_bridge_stop(&app->uhf_bridge)) {
+        return HxStatusIoError;
+    }
+    app->uhf_bridge_enabled = false;
+
+    const bool detected = he_uhf_refresh_presence(app);
+    HxStatus status = detected ? HxStatusOk : HxStatusNotFound;
+
+    if(restart_bridge && (detected || forced)) {
+        app->uhf_bridge_forced = forced;
+        if((detected || he_uhf_power_on(app)) && he_bridge_start(&app->uhf_bridge)) {
+            app->uhf_bridge_enabled = true;
+        } else {
+            app->uhf_bridge_enabled = false;
+            status = HxStatusIoError;
+        }
+    }
+
+    const size_t len = hx_build_uhf_probe_payload(
+        app->uhf_presence,
+        app->uhf_profile.family,
+        app->uhf_profile.hardware_class,
+        app->uhf_hw_version,
+        app->uhf_sw_version,
+        out,
+        out_cap);
+    if(len == 0U) {
+        return HxStatusIoError;
+    }
+
+    *out_len = len;
+    return status;
+}
+
+static HxStatus he_handle_uhf_bridge_control(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    HxUhfBridgeControlRequest parsed = {0};
+
+    if(!app || !hx_parse_uhf_bridge_control_request(request->body, request->body_len, &parsed)) {
+        return HxStatusInvalidRequest;
+    }
+
+    HxStatus status = HxStatusOk;
+    if(parsed.action == HxUhfBridgeActionDisable) {
+        if(app->uhf_bridge_enabled && !he_bridge_stop(&app->uhf_bridge)) {
+            status = HxStatusIoError;
+        } else {
+            app->uhf_bridge_enabled = false;
+            app->uhf_bridge_forced = false;
+        }
+    } else {
+        const bool force = parsed.action == HxUhfBridgeActionForceEnable;
+        if(!force && app->uhf_presence != HxUhfModulePresencePresent) {
+            (void)he_uhf_refresh_presence(app);
+        }
+
+        if(!force && app->uhf_presence != HxUhfModulePresencePresent) {
+            status = HxStatusNotFound;
+        } else if(app->uhf_bridge_enabled) {
+            app->uhf_bridge_forced = force;
+        } else if(he_uhf_power_on(app) && he_bridge_start(&app->uhf_bridge)) {
+            app->uhf_bridge_enabled = true;
+            app->uhf_bridge_forced = force;
+        } else {
+            app->uhf_bridge_enabled = false;
+            status = HxStatusIoError;
+        }
+    }
+
+    const size_t len = hx_build_uhf_bridge_payload(
+        app->uhf_bridge_enabled ? 1U : 0U,
+        app->uhf_bridge_forced ? 1U : 0U,
+        app->uhf_presence == HxUhfModulePresencePresent ? 1U : 0U,
+        out,
+        out_cap);
+    if(len == 0U) {
+        return HxStatusIoError;
+    }
+
+    *out_len = len;
+    return status;
+}
+
+static HxStatus he_handle_uhf_no5v_test(
+    HardwareExerciserApp* app,
+    const HxRequest* request,
+    uint8_t* out,
+    size_t out_cap,
+    size_t* out_len) {
+    if(!app || !request || request->body_len != 0U) {
+        return HxStatusInvalidRequest;
+    }
+
+    const HeNo5vResult result = he_run_no5v_test(app, false);
+    const size_t len = he_build_no5v_payload(&result, out, out_cap);
+    if(len == 0U) {
+        return HxStatusIoError;
+    }
+
+    *out_len = len;
+    return result.overall == HeNo5vOverallPass ? HxStatusOk : HxStatusIoError;
 }
 
 static HxStatus
@@ -1525,6 +3002,16 @@ static HxStatus he_dispatch_request(
         status = he_handle_hf15693_txrx(app, request, out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeLfReadDecoded) {
         status = he_handle_lf_read_decoded(app, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeGetBoardSnapshot) {
+        status = he_handle_get_board_snapshot(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeUhfPower) {
+        status = he_handle_uhf_power(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeUhfProbe) {
+        status = he_handle_uhf_probe(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeUhfBridgeControl) {
+        status = he_handle_uhf_bridge_control(app, request, out, out_cap, out_len);
+    } else if(request->opcode == HxOpcodeUhfNo5vTest) {
+        status = he_handle_uhf_no5v_test(app, request, out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeGpioConfigure) {
         status = he_handle_gpio_configure(app, request, out, out_cap, out_len);
     } else if(request->opcode == HxOpcodeGpioWrite) {
@@ -2077,6 +3564,9 @@ static bool he_app_shutdown(HardwareExerciserApp* app) {
         he_app_note_shutdown_failure(app, &app->uhf_bridge, app->uhf_bridge.stop_status);
         return false;
     }
+    app->uhf_bridge_enabled = false;
+    app->uhf_bridge_forced = false;
+    he_uhf_power_off(app);
 
     if(!he_bridge_stop(&app->sam_bridge)) {
         he_app_note_shutdown_failure(app, &app->sam_bridge, app->sam_bridge.stop_status);
@@ -2160,6 +3650,7 @@ static HardwareExerciserApp* he_app_alloc(void) {
 
 static void he_app_free(HardwareExerciserApp* app) {
     he_log("app free begin");
+    he_uhf_power_off(app);
     he_gpio_free(&app->gpio);
     gui_remove_view_port(app->gui, app->view_port);
     view_port_free(app->view_port);
@@ -2224,12 +3715,20 @@ int32_t hardware_exerciser_app(void* p) {
     he_log("dual cdc config applied");
 
     const bool sam_started = he_bridge_start(&app->sam_bridge);
-    const bool uhf_started = he_bridge_start(&app->uhf_bridge);
+    bool uhf_started = false;
+    if(sam_started && he_uhf_refresh_presence(app)) {
+        uhf_started = he_bridge_start(&app->uhf_bridge);
+        app->uhf_bridge_enabled = uhf_started;
+        app->uhf_bridge_forced = false;
+    }
     he_log("bridge start results sam=%u uhf=%u", sam_started, uhf_started);
-    if(!sam_started || !uhf_started) {
+    if(!sam_started || (app->uhf_presence == HxUhfModulePresencePresent && !uhf_started)) {
         /* Fall back to a status screen instead of exiting immediately so startup errors are visible. */
         const bool uhf_stopped = he_bridge_stop(&app->uhf_bridge);
         const bool sam_stopped = he_bridge_stop(&app->sam_bridge);
+        app->uhf_bridge_enabled = false;
+        app->uhf_bridge_forced = false;
+        he_uhf_power_off(app);
         if(!uhf_stopped) {
             he_app_note_shutdown_failure(app, &app->uhf_bridge, app->uhf_bridge.stop_status);
         } else if(!sam_stopped) {
@@ -2264,6 +3763,20 @@ int32_t hardware_exerciser_app(void* p) {
                     he_log("back button exit requested");
                 }
                 app->shutdown_requested = true;
+            } else if(
+                event.input.type == InputTypeShort && event.input.key == InputKeyOk &&
+                !app->startup_failed && !app->shutdown_failed && !app->no5v_running) {
+                if(furi_mutex_acquire(app->hw_mutex, 0U) == FuriStatusOk) {
+                    app->no5v_running = true;
+                    app->no5v_has_result = false;
+                    he_no5v_set_phase(app, "start");
+                    app->no5v_result = he_run_no5v_test(app, true);
+                    app->no5v_running = false;
+                    app->no5v_has_result = true;
+                    snprintf(app->no5v_phase, sizeof(app->no5v_phase), "done");
+                    app->ui_dirty = true;
+                    furi_mutex_release(app->hw_mutex);
+                }
             }
         }
         if(app->exit_requested) {

@@ -35,12 +35,18 @@
 #define HX_CAP_GPIO_VECTOR     (1UL << 13)
 #define HX_CAP_GPIO_RESET      (1UL << 14)
 #define HX_CAP_QUIT            (1UL << 15)
+#define HX_CAP_BOARD_SNAPSHOT  (1UL << 16)
+#define HX_CAP_UHF_POWER       (1UL << 17)
+#define HX_CAP_UHF_PROBE       (1UL << 18)
+#define HX_CAP_UHF_BRIDGE      (1UL << 19)
+#define HX_CAP_UHF_NO5V_TEST   (1UL << 20)
 
 /* Opcodes carried in byte 3 of the HX payload header. */
 typedef enum {
     HxOpcodePing = 0x01,
     HxOpcodeGetCaps = 0x02,
     HxOpcodeGetStatus = 0x03,
+    HxOpcodeGetBoardSnapshot = 0x04,
     HxOpcodeHf14aScan = 0x10,
     HxOpcodeHf14aTxRx = 0x11,
     HxOpcodeHf15693Scan = 0x20,
@@ -53,6 +59,10 @@ typedef enum {
     HxOpcodeGpioReadAnalog = 0x44,
     HxOpcodeGpioVectorCapture = 0x45,
     HxOpcodeGpioReset = 0x46,
+    HxOpcodeUhfPower = 0x50,
+    HxOpcodeUhfProbe = 0x51,
+    HxOpcodeUhfBridgeControl = 0x52,
+    HxOpcodeUhfNo5vTest = 0x53,
     HxOpcodeQuit = 0x7e,
     HxOpcodeAbort = 0x7f,
 } HxOpcode;
@@ -67,6 +77,44 @@ typedef enum {
     HxStatusTimeout = 0x05,
     HxStatusNotFound = 0x06,
 } HxStatus;
+
+typedef enum {
+    HxBoardClassUnknown = 0,
+    HxBoardClassNone = 1,
+    HxBoardClassSamOnly = 2,
+    HxBoardClassUhfCarrier = 3,
+} HxBoardClass;
+
+typedef enum {
+    HxUhfModulePresenceUnknown = 0,
+    HxUhfModulePresenceAbsent = 1,
+    HxUhfModulePresencePresent = 2,
+} HxUhfModulePresence;
+
+typedef enum {
+    HxUhfModuleFamilyUnknown = 0,
+    HxUhfModuleFamilyM100 = 1,
+    HxUhfModuleFamilyQM100 = 2,
+} HxUhfModuleFamily;
+
+typedef enum {
+    HxUhfHardwareClassUnknown = 0,
+    HxUhfHardwareClass20dBm = 1,
+    HxUhfHardwareClass26dBm = 2,
+    HxUhfHardwareClass30dBm = 3,
+} HxUhfHardwareClass;
+
+typedef enum {
+    HxUhfPowerActionOff = 0,
+    HxUhfPowerActionOn = 1,
+    HxUhfPowerActionHibernate = 2,
+} HxUhfPowerAction;
+
+typedef enum {
+    HxUhfBridgeActionDisable = 0,
+    HxUhfBridgeActionEnableIfPresent = 1,
+    HxUhfBridgeActionForceEnable = 2,
+} HxUhfBridgeAction;
 
 /* Parsed view of an HX payload after the magic/version header has been validated. */
 typedef struct {
@@ -129,6 +177,19 @@ typedef struct {
     size_t sample_count;
 } HxGpioVectorRequest;
 
+typedef struct {
+    uint8_t action;
+} HxUhfPowerRequest;
+
+typedef struct {
+    uint8_t action;
+} HxUhfBridgeControlRequest;
+
+typedef struct {
+    uint8_t family;
+    uint8_t hardware_class;
+} HxUhfProfile;
+
 /* XOR the provided bytes to produce the frame LRC byte. */
 uint8_t hx_calc_lrc(const uint8_t* data, size_t len);
 
@@ -187,6 +248,32 @@ bool hx_gpio_vector_sample_at(
     const HxGpioVectorRequest* request,
     size_t index,
     HxGpioVectorSample* sample);
+bool hx_parse_uhf_power_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxUhfPowerRequest* request);
+bool hx_parse_uhf_bridge_control_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxUhfBridgeControlRequest* request);
+uint8_t hx_board_classify(bool pa4_high, bool pc1_high, bool pc0_high);
+uint8_t hx_uhf_frame_checksum(const uint8_t* data, size_t len);
+bool hx_uhf_build_frame(
+    uint8_t command,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint8_t* frame_out,
+    size_t frame_out_cap,
+    size_t* frame_out_len);
+bool hx_uhf_try_parse_frame(
+    const uint8_t* stream,
+    size_t stream_len,
+    uint8_t expected_type,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len);
+HxUhfProfile hx_uhf_profile_from_versions(const char* hw_version, const char* sw_version);
 
 /*
  * Encode the HF14A scan response body as:
@@ -229,6 +316,38 @@ size_t hx_build_gpio_vector_sample(
     uint8_t sample_kind,
     uint16_t value,
     uint16_t aux,
+    uint8_t* out,
+    size_t out_cap);
+size_t hx_build_board_snapshot_payload(
+    uint8_t board_class,
+    uint8_t pa4_high,
+    uint8_t pc1_high,
+    uint8_t pc0_high,
+    uint8_t pc3_level,
+    uint8_t otg_enabled,
+    uint8_t otg_fault,
+    uint16_t vbus_mv,
+    uint8_t* out,
+    size_t out_cap);
+size_t hx_build_uhf_probe_payload(
+    uint8_t presence,
+    uint8_t family,
+    uint8_t hardware_class,
+    const char* hw_version,
+    const char* sw_version,
+    uint8_t* out,
+    size_t out_cap);
+size_t hx_build_uhf_power_payload(
+    uint8_t power_enabled,
+    uint8_t otg_enabled,
+    uint8_t otg_fault,
+    uint16_t vbus_mv,
+    uint8_t* out,
+    size_t out_cap);
+size_t hx_build_uhf_bridge_payload(
+    uint8_t bridge_enabled,
+    uint8_t forced,
+    uint8_t module_present,
     uint8_t* out,
     size_t out_cap);
 

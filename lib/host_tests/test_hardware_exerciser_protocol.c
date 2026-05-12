@@ -367,6 +367,153 @@ static MunitResult test_build_gpio_vector_sample(const MunitParameter params[], 
     return MUNIT_OK;
 }
 
+static MunitResult test_board_classifier(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    munit_assert_uint8(hx_board_classify(false, false, false), ==, HxBoardClassNone);
+    munit_assert_uint8(hx_board_classify(false, true, false), ==, HxBoardClassSamOnly);
+    munit_assert_uint8(hx_board_classify(false, false, true), ==, HxBoardClassSamOnly);
+    munit_assert_uint8(hx_board_classify(true, false, false), ==, HxBoardClassUhfCarrier);
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_frame_build_parse(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    const uint8_t payload[] = {0x00};
+    uint8_t frame[16] = {0};
+    size_t frame_len = 0U;
+    uint8_t parsed[4] = {0};
+    size_t parsed_len = 0U;
+
+    munit_assert_true(
+        hx_uhf_build_frame(0x03U, payload, sizeof(payload), frame, sizeof(frame), &frame_len));
+    const uint8_t expected[] = {0xbb, 0x00, 0x03, 0x00, 0x01, 0x00, 0x04, 0x7e};
+    munit_assert_size(frame_len, ==, sizeof(expected));
+    munit_assert_memory_equal(sizeof(expected), frame, expected);
+
+    munit_assert_true(hx_uhf_try_parse_frame(
+        frame, frame_len, 0x00U, 0x03U, parsed, sizeof(parsed), &parsed_len));
+    munit_assert_size(parsed_len, ==, sizeof(payload));
+    munit_assert_memory_equal(sizeof(payload), parsed, payload);
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_frame_parse_skips_noise(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    const uint8_t stream[] = {0x99, 0x88, 0xbb, 0x01, 0x03, 0x00, 0x01, 'M', 0x52, 0x7e};
+    uint8_t parsed[4] = {0};
+    size_t parsed_len = 0U;
+
+    munit_assert_true(hx_uhf_try_parse_frame(
+        stream, sizeof(stream), 0x01U, 0x03U, parsed, sizeof(parsed), &parsed_len));
+    munit_assert_size(parsed_len, ==, 1U);
+    munit_assert_uint8(parsed[0], ==, 'M');
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_frame_parse_skips_stale_incomplete_candidate(
+    const MunitParameter params[],
+    void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    const uint8_t stream[] = {
+        0xbb,
+        0x99,
+        0x99,
+        0xff,
+        0xff,
+        0x00,
+        0xbb,
+        0x01,
+        0x03,
+        0x00,
+        0x01,
+        'M',
+        0x52,
+        0x7e,
+    };
+    uint8_t parsed[4] = {0};
+    size_t parsed_len = 0U;
+
+    munit_assert_true(hx_uhf_try_parse_frame(
+        stream, sizeof(stream), 0x01U, 0x03U, parsed, sizeof(parsed), &parsed_len));
+    munit_assert_size(parsed_len, ==, 1U);
+    munit_assert_uint8(parsed[0], ==, 'M');
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_profile_from_versions(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    HxUhfProfile profile = hx_uhf_profile_from_versions("M100 26dBm", "v1");
+    munit_assert_uint8(profile.family, ==, HxUhfModuleFamilyM100);
+    munit_assert_uint8(profile.hardware_class, ==, HxUhfHardwareClass26dBm);
+
+    profile = hx_uhf_profile_from_versions("QM100 30dBm", "v2");
+    munit_assert_uint8(profile.family, ==, HxUhfModuleFamilyQM100);
+    munit_assert_uint8(profile.hardware_class, ==, HxUhfHardwareClass30dBm);
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_probe_payload(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    uint8_t out[32] = {0};
+    const size_t len = hx_build_uhf_probe_payload(
+        HxUhfModulePresencePresent,
+        HxUhfModuleFamilyM100,
+        HxUhfHardwareClass26dBm,
+        "HW",
+        "SW",
+        out,
+        sizeof(out));
+    const uint8_t expected[] = {
+        HxUhfModulePresencePresent,
+        HxUhfModuleFamilyM100,
+        HxUhfHardwareClass26dBm,
+        0x02,
+        'H',
+        'W',
+        0x02,
+        'S',
+        'W',
+    };
+
+    munit_assert_size(len, ==, sizeof(expected));
+    munit_assert_memory_equal(sizeof(expected), out, expected);
+    return MUNIT_OK;
+}
+
+static MunitResult test_uhf_request_parsers(const MunitParameter params[], void* fixture) {
+    (void)params;
+    (void)fixture;
+
+    HxUhfPowerRequest power = {0};
+    HxUhfBridgeControlRequest bridge = {0};
+    const uint8_t power_body[] = {HxUhfPowerActionHibernate};
+    const uint8_t bridge_body[] = {HxUhfBridgeActionForceEnable};
+    const uint8_t invalid_body[] = {0xff};
+
+    munit_assert_true(hx_parse_uhf_power_request(power_body, sizeof(power_body), &power));
+    munit_assert_uint8(power.action, ==, HxUhfPowerActionHibernate);
+    munit_assert_false(hx_parse_uhf_power_request(invalid_body, sizeof(invalid_body), &power));
+
+    munit_assert_true(
+        hx_parse_uhf_bridge_control_request(bridge_body, sizeof(bridge_body), &bridge));
+    munit_assert_uint8(bridge.action, ==, HxUhfBridgeActionForceEnable);
+    munit_assert_false(
+        hx_parse_uhf_bridge_control_request(invalid_body, sizeof(invalid_body), &bridge));
+    return MUNIT_OK;
+}
+
 static MunitTest test_hardware_exerciser_protocol_cases[] = {
     {(char*)"/parse-complete-escape-frame",
      test_parse_complete_escape_frame,
@@ -461,6 +608,43 @@ static MunitTest test_hardware_exerciser_protocol_cases[] = {
      NULL},
     {(char*)"/build-gpio-vector-sample",
      test_build_gpio_vector_sample,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/board-classifier", test_board_classifier, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL},
+    {(char*)"/uhf-frame-build-parse",
+     test_uhf_frame_build_parse,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/uhf-frame-parse-skips-noise",
+     test_uhf_frame_parse_skips_noise,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/uhf-frame-parse-skips-stale-incomplete-candidate",
+     test_uhf_frame_parse_skips_stale_incomplete_candidate,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/uhf-profile-from-versions",
+     test_uhf_profile_from_versions,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/uhf-probe-payload",
+     test_uhf_probe_payload,
+     NULL,
+     NULL,
+     MUNIT_TEST_OPTION_NONE,
+     NULL},
+    {(char*)"/uhf-request-parsers",
+     test_uhf_request_parsers,
      NULL,
      NULL,
      MUNIT_TEST_OPTION_NONE,

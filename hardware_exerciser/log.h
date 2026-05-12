@@ -5,7 +5,7 @@
 #include <furi.h>
 
 #ifndef HE_DEBUG_TRACE
-#define HE_DEBUG_TRACE 0
+#define HE_DEBUG_TRACE 1
 #endif
 
 #define HE_TRACE_FILE_NAME APP_DATA_PATH("trace.log")

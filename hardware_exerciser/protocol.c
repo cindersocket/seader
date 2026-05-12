@@ -230,6 +230,167 @@ bool hx_gpio_vector_sample_at(
     return true;
 }
 
+bool hx_parse_uhf_power_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxUhfPowerRequest* request) {
+    if(!body || !request || body_len != 1U) {
+        return false;
+    }
+
+    if(body[0] > HxUhfPowerActionHibernate) {
+        return false;
+    }
+
+    request->action = body[0];
+    return true;
+}
+
+bool hx_parse_uhf_bridge_control_request(
+    const uint8_t* body,
+    size_t body_len,
+    HxUhfBridgeControlRequest* request) {
+    if(!body || !request || body_len != 1U) {
+        return false;
+    }
+
+    if(body[0] > HxUhfBridgeActionForceEnable) {
+        return false;
+    }
+
+    request->action = body[0];
+    return true;
+}
+
+uint8_t hx_board_classify(bool pa4_high, bool pc1_high, bool pc0_high) {
+    if(pa4_high) {
+        return HxBoardClassUhfCarrier;
+    }
+
+    if(pc1_high || pc0_high) {
+        return HxBoardClassSamOnly;
+    }
+
+    return HxBoardClassNone;
+}
+
+uint8_t hx_uhf_frame_checksum(const uint8_t* data, size_t len) {
+    uint32_t sum = 0U;
+    if(!data) {
+        return 0U;
+    }
+
+    for(size_t i = 0U; i < len; i++) {
+        sum += data[i];
+    }
+    return (uint8_t)(sum & 0xffU);
+}
+
+bool hx_uhf_build_frame(
+    uint8_t command,
+    const uint8_t* payload,
+    size_t payload_len,
+    uint8_t* frame_out,
+    size_t frame_out_cap,
+    size_t* frame_out_len) {
+    if(!frame_out || !frame_out_len || payload_len > 0xffffU) {
+        return false;
+    }
+    if(payload_len > 0U && !payload) {
+        return false;
+    }
+    if(frame_out_cap < 7U + payload_len) {
+        return false;
+    }
+
+    frame_out[0] = 0xbbU;
+    frame_out[1] = 0x00U;
+    frame_out[2] = command;
+    frame_out[3] = (uint8_t)(payload_len >> 8U);
+    frame_out[4] = (uint8_t)payload_len;
+    if(payload_len > 0U) {
+        memcpy(frame_out + 5U, payload, payload_len);
+    }
+    frame_out[5U + payload_len] =
+        hx_uhf_frame_checksum(frame_out + 1U, 4U + payload_len);
+    frame_out[6U + payload_len] = 0x7eU;
+    *frame_out_len = 7U + payload_len;
+    return true;
+}
+
+bool hx_uhf_try_parse_frame(
+    const uint8_t* stream,
+    size_t stream_len,
+    uint8_t expected_type,
+    uint8_t expected_cmd,
+    uint8_t* payload,
+    size_t payload_cap,
+    size_t* payload_len) {
+    if(!stream || stream_len < 7U || !payload || !payload_len) {
+        return false;
+    }
+
+    for(size_t offset = 0U; offset + 7U <= stream_len; offset++) {
+        if(stream[offset] != 0xbbU) {
+            continue;
+        }
+
+        const size_t frame_payload_len =
+            ((size_t)stream[offset + 3U] << 8U) | stream[offset + 4U];
+        const size_t frame_len = frame_payload_len + 7U;
+        if(offset + frame_len > stream_len) {
+            continue;
+        }
+        if(stream[offset + frame_len - 1U] != 0x7eU) {
+            continue;
+        }
+        if(hx_uhf_frame_checksum(stream + offset + 1U, frame_len - 3U) !=
+           stream[offset + frame_len - 2U]) {
+            continue;
+        }
+        if(stream[offset + 1U] != expected_type || stream[offset + 2U] != expected_cmd) {
+            continue;
+        }
+
+        if(frame_payload_len > payload_cap) {
+            continue;
+        }
+        memcpy(payload, stream + offset + 5U, frame_payload_len);
+        *payload_len = frame_payload_len;
+        return true;
+    }
+
+    return false;
+}
+
+HxUhfProfile hx_uhf_profile_from_versions(const char* hw_version, const char* sw_version) {
+    HxUhfProfile profile = {
+        .family = HxUhfModuleFamilyUnknown,
+        .hardware_class = HxUhfHardwareClassUnknown,
+    };
+    (void)sw_version;
+
+    if(!hw_version) {
+        return profile;
+    }
+
+    if(strstr(hw_version, "QM100")) {
+        profile.family = HxUhfModuleFamilyQM100;
+    } else if(strstr(hw_version, "M100")) {
+        profile.family = HxUhfModuleFamilyM100;
+    }
+
+    if(strstr(hw_version, "30dBm")) {
+        profile.hardware_class = HxUhfHardwareClass30dBm;
+    } else if(strstr(hw_version, "26dBm")) {
+        profile.hardware_class = HxUhfHardwareClass26dBm;
+    } else if(strstr(hw_version, "20dBm")) {
+        profile.hardware_class = HxUhfHardwareClass20dBm;
+    }
+
+    return profile;
+}
+
 size_t hx_build_hf14a_scan_payload(
     const uint8_t* uid,
     size_t uid_len,
@@ -262,6 +423,23 @@ size_t hx_build_hf14a_scan_payload(
     return total_len;
 }
 
+static size_t hx_copy_string_field(const char* value, uint8_t* out, size_t out_cap) {
+    if(!value || !out || out_cap == 0U) {
+        return 0U;
+    }
+
+    const size_t len = strlen(value);
+    if(len > 255U || out_cap < 1U + len) {
+        return 0U;
+    }
+
+    out[0] = (uint8_t)len;
+    if(len > 0U) {
+        memcpy(out + 1U, value, len);
+    }
+    return 1U + len;
+}
+
 size_t hx_build_response_payload(
     uint8_t opcode,
     uint8_t status,
@@ -289,6 +467,101 @@ size_t hx_build_response_payload(
     }
 
     return total_len;
+}
+
+size_t hx_build_board_snapshot_payload(
+    uint8_t board_class,
+    uint8_t pa4_high,
+    uint8_t pc1_high,
+    uint8_t pc0_high,
+    uint8_t pc3_level,
+    uint8_t otg_enabled,
+    uint8_t otg_fault,
+    uint16_t vbus_mv,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 10U) {
+        return 0U;
+    }
+
+    out[0] = board_class;
+    out[1] = pa4_high ? 1U : 0U;
+    out[2] = pc1_high ? 1U : 0U;
+    out[3] = pc0_high ? 1U : 0U;
+    out[4] = pc3_level ? 1U : 0U;
+    out[5] = otg_enabled ? 1U : 0U;
+    out[6] = otg_fault ? 1U : 0U;
+    out[7] = 0U;
+    out[8] = (uint8_t)(vbus_mv & 0xffU);
+    out[9] = (uint8_t)(vbus_mv >> 8U);
+    return 10U;
+}
+
+size_t hx_build_uhf_probe_payload(
+    uint8_t presence,
+    uint8_t family,
+    uint8_t hardware_class,
+    const char* hw_version,
+    const char* sw_version,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 3U) {
+        return 0U;
+    }
+
+    out[0] = presence;
+    out[1] = family;
+    out[2] = hardware_class;
+    size_t used = 3U;
+
+    const size_t hw_len = hx_copy_string_field(hw_version ? hw_version : "", out + used, out_cap - used);
+    if(hw_len == 0U) {
+        return 0U;
+    }
+    used += hw_len;
+
+    const size_t sw_len = hx_copy_string_field(sw_version ? sw_version : "", out + used, out_cap - used);
+    if(sw_len == 0U) {
+        return 0U;
+    }
+    used += sw_len;
+    return used;
+}
+
+size_t hx_build_uhf_power_payload(
+    uint8_t power_enabled,
+    uint8_t otg_enabled,
+    uint8_t otg_fault,
+    uint16_t vbus_mv,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 6U) {
+        return 0U;
+    }
+
+    out[0] = power_enabled ? 1U : 0U;
+    out[1] = otg_enabled ? 1U : 0U;
+    out[2] = otg_fault ? 1U : 0U;
+    out[3] = 0U;
+    out[4] = (uint8_t)(vbus_mv & 0xffU);
+    out[5] = (uint8_t)(vbus_mv >> 8U);
+    return 6U;
+}
+
+size_t hx_build_uhf_bridge_payload(
+    uint8_t bridge_enabled,
+    uint8_t forced,
+    uint8_t module_present,
+    uint8_t* out,
+    size_t out_cap) {
+    if(!out || out_cap < 3U) {
+        return 0U;
+    }
+
+    out[0] = bridge_enabled ? 1U : 0U;
+    out[1] = forced ? 1U : 0U;
+    out[2] = module_present ? 1U : 0U;
+    return 3U;
 }
 
 size_t hx_build_gpio_pin_info(
